@@ -15,8 +15,8 @@ use decoder::{AsyncVideoDecoderHandle, spawn_decoder};
 #[cfg(target_os = "macos")]
 use frame_pipeline::finish_encoder_bgra_surface;
 use frame_pipeline::{
-    NV12BufferPool, RenderSession, finish_encoder_nv12_pooled, finish_encoder_timed,
-    flush_pending_readback,
+    NV12BufferPool, ReadbackInfo, RenderSession, finish_encoder_nv12_pooled, finish_encoder_with,
+    flush_pending_readback, flush_pending_readback_with, readback_nv12, readback_rgba,
 };
 use futures::future::OptionFuture;
 use layers::{
@@ -30,7 +30,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
-use std::{borrow::Cow, path::PathBuf, time::Instant};
+use std::{path::PathBuf, time::Instant};
 use tokio::sync::mpsc;
 
 pub mod camera3d;
@@ -59,6 +59,7 @@ mod recorded_cursor_assets;
 mod scene;
 mod segment_timing;
 pub mod spring_mass_damper;
+mod style_cache;
 mod takeover;
 mod text;
 mod transition;
@@ -384,7 +385,9 @@ struct TransitionSideDecoders {
     screen: DecoderSource,
     camera: Option<DecoderSource>,
     force_ffmpeg: bool,
-    decoders: tokio::sync::OnceCell<Option<RecordingSegmentDecoders>>,
+    decoders: tokio::sync::OnceCell<Option<Arc<RecordingSegmentDecoders>>>,
+    // Serialize only initialization; each caller's OnceCell owns its lease.
+    shared: Arc<tokio::sync::Mutex<std::sync::Weak<RecordingSegmentDecoders>>>,
 }
 
 #[derive(Clone)]
@@ -503,8 +506,25 @@ impl RecordingSegmentDecoders {
                 camera: camera_source,
                 force_ffmpeg,
                 decoders: tokio::sync::OnceCell::new(),
+                shared: Arc::new(tokio::sync::Mutex::new(std::sync::Weak::new())),
             })),
         })
+    }
+
+    /// Share primary readers, but keep lazy secondary readers local to a
+    /// playback prefetch window. In-flight clones keep that window alive.
+    pub fn with_fresh_transition_readers(&self) -> Self {
+        let mut scoped = self.clone();
+        scoped.transition_readers = self.transition_readers.as_ref().map(|side| {
+            Arc::new(TransitionSideDecoders {
+                screen: side.screen.clone(),
+                camera: side.camera.clone(),
+                force_ffmpeg: side.force_ffmpeg,
+                decoders: tokio::sync::OnceCell::new(),
+                shared: side.shared.clone(),
+            })
+        });
+        scoped
     }
 
     /// The decoders for the outgoing side of a transition whose incoming
@@ -522,6 +542,10 @@ impl RecordingSegmentDecoders {
         let decoders = side
             .decoders
             .get_or_init(|| async {
+                let mut shared = side.shared.lock().await;
+                if let Some(decoders) = shared.upgrade() {
+                    return Some(decoders);
+                }
                 let screen = async {
                     if screen_shared {
                         Ok(self.screen.clone())
@@ -540,12 +564,16 @@ impl RecordingSegmentDecoders {
                     }
                 };
                 match tokio::try_join!(screen, camera) {
-                    Ok((screen, camera)) => Some(RecordingSegmentDecoders {
-                        screen,
-                        camera,
-                        segment_offset: self.segment_offset,
-                        transition_readers: None,
-                    }),
+                    Ok((screen, camera)) => {
+                        let decoders = Arc::new(RecordingSegmentDecoders {
+                            screen,
+                            camera,
+                            segment_offset: self.segment_offset,
+                            transition_readers: None,
+                        });
+                        *shared = Arc::downgrade(&decoders);
+                        Some(decoders)
+                    }
                     Err(error) => {
                         tracing::warn!(
                             %error,
@@ -556,7 +584,7 @@ impl RecordingSegmentDecoders {
                 }
             })
             .await;
-        decoders.as_ref().unwrap_or(self)
+        decoders.as_deref().unwrap_or(self)
     }
 
     pub async fn get_frames(
@@ -2486,6 +2514,7 @@ pub struct RenderVideoConstants {
     pub is_software_adapter: bool,
     adapter_name: String,
     frozen_recorded_cursors: Option<FrozenRecordedCursorAssets>,
+    style_cache: style_cache::StyleProjectCache,
 }
 
 /// Instance, adapter and device the way every renderer creates them. A
@@ -2649,6 +2678,7 @@ impl RenderVideoConstants {
             meta,
             recording_meta,
             frozen_recorded_cursors: None,
+            style_cache: Default::default(),
             is_software_adapter: shared.is_software_adapter,
             adapter_name,
         })
@@ -2679,6 +2709,7 @@ impl RenderVideoConstants {
             meta,
             recording_meta,
             frozen_recorded_cursors: None,
+            style_cache: Default::default(),
             is_software_adapter: shared.is_software_adapter,
             adapter_name,
         }
@@ -2740,6 +2771,7 @@ impl RenderVideoConstants {
             meta,
             recording_meta,
             frozen_recorded_cursors: None,
+            style_cache: Default::default(),
             is_software_adapter,
             adapter_name,
         })
@@ -4154,7 +4186,7 @@ impl ProjectUniforms {
         let camera_only_padding = project.camera_only_padding_at(timeline_time);
         let base_crop = Self::get_crop(options, project);
         let base_padding = project.background.padding;
-        let styled_project = project.style_at(timeline_time);
+        let styled_project = constants.style_cache.resolve(shared_project, timeline_time);
         let project = styled_project.as_ref();
         let styled_crop = Self::get_crop(options, project);
         let has_layout_override =
@@ -5211,10 +5243,7 @@ impl ProjectUniforms {
             frame_chrome,
             notch,
             display_outer_bounds,
-            project: match styled_project {
-                Cow::Borrowed(_) => Arc::clone(shared_project),
-                Cow::Owned(styled) => Arc::new(styled),
-            },
+            project: styled_project,
             zoom,
             scene,
             split: split_layout,
@@ -6306,6 +6335,7 @@ mod style_image_tests {
                 .clone(),
             recording_meta,
             frozen_recorded_cursors: None,
+            style_cache: Default::default(),
             background_textures: Arc::new(BackgroundTextureCache::default()),
             is_software_adapter: false,
         };
@@ -6371,10 +6401,12 @@ mod style_image_tests {
         let zoom = ZoomTransformTimeline::from_project(&project, &cursor, 3.0, XY::new(160, 90));
         let mut layers = RendererLayers::new(&constants.device, &constants.queue);
         let mut renderer = FrameRenderer::new(&constants);
-        for frame_number in [41, 42, 60, 83, 84] {
+        let shared_project = Arc::new(project.clone());
+        let mut previous_style: Option<(bool, Arc<ProjectConfiguration>)> = None;
+        for frame_number in [41, 42, 60, 83, 84, 60, 83, 41] {
             let uniforms = ProjectUniforms::new(
                 &constants,
-                &Arc::new(project.clone()),
+                &shared_project,
                 frame_number,
                 60,
                 XY::new(160, 90),
@@ -6385,6 +6417,12 @@ mod style_image_tests {
             );
             assert_eq!(uniforms.output_size, (160, 90));
             let active = (42..84).contains(&frame_number);
+            if let Some((previous_active, previous_project)) = &previous_style
+                && *previous_active == active
+            {
+                assert!(Arc::ptr_eq(previous_project, &uniforms.project));
+            }
+            previous_style = Some((active, Arc::clone(&uniforms.project)));
             if active {
                 assert!(uniforms.display.target_size[0] < uniforms.display.target_size[1]);
                 let camera = uniforms.camera_only.expect("camera-only layout");
@@ -6555,6 +6593,7 @@ mod export_order_tests {
                 .clone(),
             recording_meta,
             frozen_recorded_cursors: None,
+            style_cache: Default::default(),
             background_textures: Arc::new(BackgroundTextureCache::default()),
             is_software_adapter: is_software_adapter || software_path,
         })
@@ -6723,7 +6762,7 @@ mod export_order_tests {
     }
 
     #[test]
-    fn readback_allocation_failure_stops_export_without_retry_or_substitution() {
+    fn rgba_allocation_failure_stops_rgba_export_but_does_not_affect_direct_nv12() {
         for rgba in [true, false] {
             for failed_frame in [0, 5, FRAMES - 1] {
                 let Some((result, order)) =
@@ -6731,6 +6770,12 @@ mod export_order_tests {
                 else {
                     return;
                 };
+                if !rgba {
+                    result
+                        .expect("direct mapped NV12 does not allocate an intermediate RGBA frame");
+                    assert_eq!(order, (0..FRAMES).collect::<Vec<_>>());
+                    continue;
+                }
                 assert!(
                     matches!(
                         result,
@@ -6890,6 +6935,7 @@ mod nv12_flush_tests {
                 .clone(),
             recording_meta,
             frozen_recorded_cursors: None,
+            style_cache: Default::default(),
             background_textures: Arc::new(BackgroundTextureCache::default()),
             is_software_adapter,
         })
@@ -7014,6 +7060,91 @@ mod nv12_flush_tests {
             lumas.windows(2).all(|pair| pair[0] < pair[1]),
             "each frame keeps its own contents: {lumas:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn software_transition_nv12_matches_rgba_and_preserves_timestamps() {
+        let constants = nv12_test_constants(true).await.expect("test adapter");
+        let cursor = CursorEvents {
+            clicks: vec![],
+            moves: vec![],
+        };
+        let frames = DecodedSegmentFrames {
+            screen_size: XY::new(4, 4),
+            screen_frame: None,
+            camera_frame: None,
+            segment_time: 0.0,
+            recording_time: 0.0,
+            segment_has_camera: false,
+        };
+        let input = |frame_number, color| {
+            let mut project = ProjectConfiguration::default();
+            project.background.source = cap_project::BackgroundSource::Color {
+                value: color,
+                alpha: 255,
+            };
+            let zoom = ZoomTransformTimeline::from_project(&project, &cursor, 1.0, XY::new(4, 4));
+            let uniforms = ProjectUniforms::new(
+                &constants,
+                &Arc::new(project),
+                frame_number,
+                60,
+                XY::new(4, 4),
+                &cursor,
+                &frames,
+                1.0,
+                &zoom,
+            );
+            TransitionRenderInput {
+                segment_frames: frames.clone(),
+                uniforms,
+                cursor: &cursor,
+                render_display: false,
+            }
+        };
+        let mut rgba_renderer = FrameRenderer::new(&constants);
+        let mut nv12_renderer = FrameRenderer::new(&constants);
+        let mut rgba_layers = RendererLayers::new(&constants.device, &constants.queue);
+        let mut nv12_layers = RendererLayers::new(&constants.device, &constants.queue);
+        for (index, kind) in [
+            ClipTransitionType::CrossFade,
+            ClipTransitionType::FadeThroughBlack,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let frame_number = index as u32 + 7;
+            let outgoing = input(frame_number, [255, 0, 0]);
+            let incoming = input(frame_number, [0, 0, 255]);
+            let rgba = rgba_renderer
+                .render_transition_immediate(
+                    outgoing.clone(),
+                    incoming.clone(),
+                    kind,
+                    0.35,
+                    &mut rgba_layers,
+                )
+                .await
+                .expect("RGBA transition");
+            assert!(
+                nv12_renderer
+                    .render_transition_nv12(outgoing, incoming, kind, 0.35, &mut nv12_layers)
+                    .await
+                    .expect("NV12 transition")
+                    .is_none()
+            );
+            let nv12 = nv12_renderer
+                .flush_pipeline_nv12()
+                .await
+                .expect("pending transition")
+                .expect("transition flush");
+            let mut expected = vec![0; 24];
+            cpu_yuv::rgba_to_nv12_bt709(&rgba.data, 4, 4, rgba.padded_bytes_per_row, &mut expected);
+            assert_eq!(nv12.data.as_ref(), expected);
+            assert_eq!(nv12.frame_number, rgba.frame_number);
+            assert_eq!(nv12.target_time_ns, rgba.target_time_ns);
+            assert!(nv12_renderer.flush_pipeline_nv12().await.is_none());
+        }
     }
 
     #[tokio::test]
@@ -7216,6 +7347,26 @@ impl<'a> FrameRenderer<'a> {
         render_display: bool,
         layers: &mut RendererLayers,
     ) -> Result<(Option<RenderedFrame>, FrameRenderStageTimings), RenderingError> {
+        self.render_with_output(
+            segment_frames,
+            uniforms,
+            cursor,
+            render_display,
+            layers,
+            |data, info, _| readback_rgba(data, info),
+        )
+        .await
+    }
+
+    async fn render_with_output<T>(
+        &mut self,
+        segment_frames: DecodedSegmentFrames,
+        uniforms: ProjectUniforms,
+        cursor: &CursorEvents,
+        render_display: bool,
+        layers: &mut RendererLayers,
+        mut output: impl FnMut(&[u8], ReadbackInfo, &NV12BufferPool) -> Result<T, RenderingError>,
+    ) -> Result<(Option<T>, FrameRenderStageTimings), RenderingError> {
         let phase = std::mem::take(&mut self.readiness_first_render)
             .then(|| readiness::Phase::start("frame.rgba_first_render"));
         let mut last_error = None;
@@ -7253,8 +7404,8 @@ impl<'a> FrameRenderer<'a> {
                 uniforms.clone(),
                 cursor,
                 render_display,
-                layers,
-                session,
+                (layers, session),
+                |data, info| output(data, info, &self.nv12_buffer_pool),
             )
             .await
             {
@@ -7296,6 +7447,26 @@ impl<'a> FrameRenderer<'a> {
         progress: f32,
         layers: &mut RendererLayers,
     ) -> Result<Option<RenderedFrame>, RenderingError> {
+        self.render_transition_with(
+            outgoing,
+            incoming,
+            kind,
+            progress,
+            layers,
+            |data, info, _| readback_rgba(data, info),
+        )
+        .await
+    }
+
+    async fn render_transition_with<T>(
+        &mut self,
+        outgoing: TransitionRenderInput<'_>,
+        incoming: TransitionRenderInput<'_>,
+        kind: ClipTransitionType,
+        progress: f32,
+        layers: &mut RendererLayers,
+        mut output: impl FnMut(&[u8], ReadbackInfo, &NV12BufferPool) -> Result<T, RenderingError>,
+    ) -> Result<Option<T>, RenderingError> {
         let mut last_error = None;
 
         for attempt in 0..Self::MAX_RENDER_RETRIES {
@@ -7347,12 +7518,13 @@ impl<'a> FrameRenderer<'a> {
                 Err(error) => return Err(error),
             };
 
-            match finish_encoder_timed(
+            match finish_encoder_with(
                 session,
                 &self.constants.device,
                 &self.constants.queue,
                 &incoming.uniforms,
                 encoder,
+                |data, info| output(data, info, &self.nv12_buffer_pool),
             )
             .await
             {
@@ -7557,8 +7729,11 @@ impl<'a> FrameRenderer<'a> {
         &mut self,
     ) -> Option<Result<frame_pipeline::Nv12RenderedFrame, RenderingError>> {
         if self.constants.is_software_adapter {
-            let frame = self.flush_pipeline().await?;
-            return Some(frame.map(|frame| self.convert_rgba_to_nv12(frame)));
+            let session = self.session.as_mut()?;
+            return flush_pending_readback_with(session, &self.constants.device, |data, info| {
+                readback_nv12(data, info, &self.nv12_buffer_pool)
+            })
+            .await;
         }
 
         let nv12_converter = self.nv12_converter.as_mut()?;
@@ -7597,10 +7772,9 @@ impl<'a> FrameRenderer<'a> {
         layers: &mut RendererLayers,
     ) -> Result<Option<frame_pipeline::Nv12RenderedFrame>, RenderingError> {
         if self.constants.is_software_adapter {
-            let frame = self
-                .render_transition(outgoing, incoming, kind, progress, layers)
-                .await?;
-            return Ok(frame.map(|frame| self.convert_rgba_to_nv12(frame)));
+            return self
+                .render_transition_with(outgoing, incoming, kind, progress, layers, readback_nv12)
+                .await;
         }
 
         let mut last_error = None;
@@ -7777,100 +7951,16 @@ impl<'a> FrameRenderer<'a> {
         render_display: bool,
         layers: &mut RendererLayers,
     ) -> Result<Option<frame_pipeline::Nv12RenderedFrame>, RenderingError> {
-        let rgba_frame = self
-            .render(
-                segment_frames,
-                uniforms.clone(),
-                cursor,
-                render_display,
-                layers,
-            )
-            .await?;
-
-        let Some(rgba_frame) = rgba_frame else {
-            return Ok(None);
-        };
-
-        Ok(Some(self.convert_rgba_to_nv12(rgba_frame)))
-    }
-
-    fn convert_rgba_to_nv12(
-        &mut self,
-        rgba_frame: RenderedFrame,
-    ) -> frame_pipeline::Nv12RenderedFrame {
-        let width = rgba_frame.width;
-        let height = rgba_frame.height;
-        let padded_bytes_per_row = rgba_frame.padded_bytes_per_row;
-        let frame_number = rgba_frame.frame_number;
-        let target_time_ns = rgba_frame.target_time_ns;
-
-        let nv12_size = (width as usize) * (height as usize) * 3 / 2;
-        let mut nv12_buf = self.nv12_buffer_pool.acquire(nv12_size);
-
-        let y_stride = width as usize;
-        let uv_stride = width as usize;
-        let y_plane_size = y_stride * height as usize;
-        let uv_plane_size = uv_stride * (height as usize / 2);
-        nv12_buf.resize(y_plane_size + uv_plane_size, 0);
-
-        let src_data = &rgba_frame.data;
-        let src_stride = padded_bytes_per_row as usize;
-
-        for row in 0..height as usize {
-            let src_row = &src_data[row * src_stride..row * src_stride + width as usize * 4];
-            let y_row = &mut nv12_buf[row * y_stride..(row + 1) * y_stride];
-            for col in 0..width as usize {
-                let r = src_row[col * 4] as i32;
-                let g = src_row[col * 4 + 1] as i32;
-                let b = src_row[col * 4 + 2] as i32;
-                y_row[col] = cpu_yuv::bt709_luma(r, g, b);
-            }
-        }
-
-        let uv_offset = y_plane_size;
-        for row in 0..(height as usize / 2) {
-            let src_row0 =
-                &src_data[row * 2 * src_stride..row * 2 * src_stride + width as usize * 4];
-            let src_row1 = &src_data
-                [(row * 2 + 1) * src_stride..(row * 2 + 1) * src_stride + width as usize * 4];
-            let uv_row =
-                &mut nv12_buf[uv_offset + row * uv_stride..uv_offset + (row + 1) * uv_stride];
-            for col in 0..(width as usize / 2) {
-                let r = (src_row0[col * 8] as i32
-                    + src_row0[col * 8 + 4] as i32
-                    + src_row1[col * 8] as i32
-                    + src_row1[col * 8 + 4] as i32
-                    + 2)
-                    / 4;
-                let g = (src_row0[col * 8 + 1] as i32
-                    + src_row0[col * 8 + 5] as i32
-                    + src_row1[col * 8 + 1] as i32
-                    + src_row1[col * 8 + 5] as i32
-                    + 2)
-                    / 4;
-                let b = (src_row0[col * 8 + 2] as i32
-                    + src_row0[col * 8 + 6] as i32
-                    + src_row1[col * 8 + 2] as i32
-                    + src_row1[col * 8 + 6] as i32
-                    + 2)
-                    / 4;
-                [uv_row[col * 2], uv_row[col * 2 + 1]] = cpu_yuv::bt709_chroma(r, g, b);
-            }
-        }
-
-        frame_pipeline::Nv12RenderedFrame {
-            data: self.nv12_buffer_pool.wrap(nv12_buf),
-            width,
-            height,
-            y_stride: width,
-            frame_number,
-            target_time_ns,
-            format: frame_pipeline::GpuOutputFormat::Nv12,
-            #[cfg(target_os = "macos")]
-            surface: None,
-            #[cfg(target_os = "linux")]
-            gpu: None,
-        }
+        self.render_with_output(
+            segment_frames,
+            uniforms,
+            cursor,
+            render_display,
+            layers,
+            readback_nv12,
+        )
+        .await
+        .map(|(frame, _)| frame)
     }
 
     async fn render_nv12_gpu_path(
@@ -8938,15 +9028,16 @@ impl LayerPasses<'_> {
     }
 }
 
-async fn produce_frame_with_timings(
+async fn produce_frame_with_timings<T>(
     constants: &RenderVideoConstants,
     segment_frames: DecodedSegmentFrames,
     uniforms: ProjectUniforms,
     cursor: &CursorEvents,
     render_display: bool,
-    layers: &mut RendererLayers,
-    session: &mut RenderSession,
-) -> Result<(Option<RenderedFrame>, FrameRenderStageTimings), RenderingError> {
+    state: (&mut RendererLayers, &mut RenderSession),
+    output: impl FnOnce(&[u8], ReadbackInfo) -> Result<T, RenderingError>,
+) -> Result<(Option<T>, FrameRenderStageTimings), RenderingError> {
+    let (layers, session) = state;
     let mut encoder = constants.device.create_command_encoder(
         &(wgpu::CommandEncoderDescriptor {
             label: Some("Render Encoder"),
@@ -8978,12 +9069,13 @@ async fn produce_frame_with_timings(
     timings.layer_render_duration = layer_render_start.elapsed();
 
     let finish_start = Instant::now();
-    let (frame, finish_timings) = finish_encoder_timed(
+    let (frame, finish_timings) = finish_encoder_with(
         session,
         &constants.device,
         &constants.queue,
         &uniforms,
         encoder,
+        output,
     )
     .await?;
     timings.finish_duration = finish_start.elapsed();
@@ -10636,5 +10728,103 @@ mod initial_decode_recovery_tests {
 
         assert!(times.iter().all(|time| *time >= 0.0));
         assert!(times.last().copied().unwrap_or_default() >= 0.0);
+    }
+}
+
+#[cfg(test)]
+mod transition_reader_lifetime_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "Requires CAP_DECODER_TEST_VIDEO (at least 3 seconds, 30 fps)"]
+    async fn transition_reader_scopes_share_release_and_reopen() {
+        ffmpeg::init().unwrap();
+        let source = DecoderSource {
+            path: std::env::var_os("CAP_DECODER_TEST_VIDEO").unwrap().into(),
+            fps: 30,
+            offset: 0.0,
+        };
+        let primary = RecordingSegmentDecoders {
+            screen: spawn_screen_decoder(source.clone(), true).await.unwrap(),
+            camera: None,
+            segment_offset: 0.0,
+            transition_readers: Some(Arc::new(TransitionSideDecoders {
+                screen: source,
+                camera: None,
+                force_ffmpeg: true,
+                decoders: tokio::sync::OnceCell::new(),
+                shared: Arc::new(tokio::sync::Mutex::new(std::sync::Weak::new())),
+            })),
+        };
+        let registry = primary.transition_readers.as_ref().unwrap().shared.clone();
+        let first = primary.with_fresh_transition_readers();
+        let second = primary.with_fresh_transition_readers();
+
+        // Cancel deterministically while initialization waits for the registry.
+        // This does not claim to join a native worker already being opened.
+        let guard = registry.lock().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::ZERO, first.transition_side())
+                .await
+                .is_err()
+        );
+        assert!(
+            first
+                .transition_readers
+                .as_ref()
+                .unwrap()
+                .decoders
+                .get()
+                .is_none()
+        );
+        drop(guard);
+
+        let (a, b) = tokio::join!(first.transition_side(), second.transition_side());
+        assert!(std::ptr::eq(a, b));
+        assert!(
+            primary
+                .transition_readers
+                .as_ref()
+                .unwrap()
+                .decoders
+                .get()
+                .is_none()
+        );
+        assert!(registry.lock().await.upgrade().is_some());
+        drop(first);
+        assert!(registry.lock().await.upgrade().is_some());
+        drop(second);
+        assert!(registry.lock().await.upgrade().is_none());
+
+        // Repeated transition windows reopen, including backward source reads.
+        // Compare actual planes rather than only counting successful requests.
+        for time in [0.0, 2.0, 0.5, 2.0, 1.0] {
+            let expected = primary.screen.get_frame_initial(time).await.unwrap();
+            let scope = primary.with_fresh_transition_readers();
+            let actual = scope
+                .transition_side()
+                .await
+                .screen
+                .get_frame_initial(time)
+                .await
+                .unwrap();
+            assert_eq!(actual.width(), expected.width());
+            assert_eq!(actual.height(), expected.height());
+            assert_eq!(actual.y_plane(), expected.y_plane(), "Y at {time}");
+            assert_eq!(actual.u_plane(), expected.u_plane(), "U at {time}");
+            assert_eq!(actual.v_plane(), expected.v_plane(), "V at {time}");
+            assert_eq!(actual.uv_plane(), expected.uv_plane(), "UV at {time}");
+            drop(scope);
+            assert!(registry.lock().await.upgrade().is_none());
+        }
+
+        // A preview-owned reader must be reused, not duplicated or reclaimed.
+        let preview = primary.transition_side().await;
+        let scope = primary.with_fresh_transition_readers();
+        assert!(std::ptr::eq(preview, scope.transition_side().await));
+        drop(scope);
+        assert!(registry.lock().await.upgrade().is_some());
+        drop(primary);
+        assert!(registry.lock().await.upgrade().is_none());
     }
 }

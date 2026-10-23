@@ -1691,6 +1691,61 @@ pub(crate) mod readback_allocation_failure {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ReadbackInfo {
+    width: u32,
+    height: u32,
+    padded_bytes_per_row: u32,
+    frame_number: u32,
+    target_time_ns: u64,
+}
+
+pub(crate) fn readback_rgba(
+    data: &[u8],
+    info: ReadbackInfo,
+) -> Result<RenderedFrame, RenderingError> {
+    let mut owned = allocate_readback(data.len(), info.frame_number)?;
+    owned.extend_from_slice(data);
+    Ok(RenderedFrame {
+        data: Arc::new(owned),
+        padded_bytes_per_row: info.padded_bytes_per_row,
+        width: info.width,
+        height: info.height,
+        frame_number: info.frame_number,
+        target_time_ns: info.target_time_ns,
+    })
+}
+
+pub(crate) fn readback_nv12(
+    data: &[u8],
+    info: ReadbackInfo,
+    pool: &NV12BufferPool,
+) -> Result<Nv12RenderedFrame, RenderingError> {
+    let size = info.width as usize * (info.height as usize + info.height as usize / 2);
+    let mut output = pool.acquire(size);
+    output.resize(size, 0);
+    crate::cpu_yuv::rgba_to_nv12_bt709(
+        data,
+        info.width,
+        info.height,
+        info.padded_bytes_per_row,
+        &mut output,
+    );
+    Ok(Nv12RenderedFrame {
+        data: pool.wrap(output),
+        width: info.width,
+        height: info.height,
+        y_stride: info.width,
+        frame_number: info.frame_number,
+        target_time_ns: info.target_time_ns,
+        format: GpuOutputFormat::Nv12,
+        #[cfg(target_os = "macos")]
+        surface: None,
+        #[cfg(target_os = "linux")]
+        gpu: None,
+    })
+}
+
 impl PendingReadback {
     fn unmap(&mut self) {
         if self.mapped {
@@ -1704,7 +1759,15 @@ impl PendingReadback {
         RenderingError::BufferMapWaitingFailed
     }
 
-    pub async fn wait(mut self, device: &wgpu::Device) -> Result<RenderedFrame, RenderingError> {
+    pub async fn wait(self, device: &wgpu::Device) -> Result<RenderedFrame, RenderingError> {
+        self.wait_with(device, readback_rgba).await
+    }
+
+    async fn wait_with<T>(
+        mut self,
+        device: &wgpu::Device,
+        output: impl FnOnce(&[u8], ReadbackInfo) -> Result<T, RenderingError>,
+    ) -> Result<T, RenderingError> {
         let start_time = Instant::now();
         let completed = wait_for_submission(
             device,
@@ -1747,28 +1810,27 @@ impl PendingReadback {
             self.unmap();
             return Err(RenderingError::BufferMapWaitingFailed);
         };
-        let mut data_vec = allocate_readback(active_bytes, self.frame_number)?;
         let buffer_slice = self.buffer.slice(..active_bytes as u64);
         let data = buffer_slice.get_mapped_range();
-        data_vec.extend_from_slice(&data);
-
+        let result = output(
+            &data,
+            ReadbackInfo {
+                padded_bytes_per_row: self.padded_bytes_per_row,
+                width: self.width,
+                height: self.height,
+                frame_number: self.frame_number,
+                target_time_ns: (self.frame_number as u64 * 1_000_000_000)
+                    / self.frame_rate.max(1) as u64,
+            },
+        );
         drop(data);
         self.unmap();
-
-        let target_time_ns =
-            (self.frame_number as u64 * 1_000_000_000) / self.frame_rate.max(1) as u64;
-
-        if let Some(phase) = self.readiness_phase.take() {
+        if result.is_ok()
+            && let Some(phase) = self.readiness_phase.take()
+        {
             phase.finish("frame_ready");
         }
-        Ok(RenderedFrame {
-            data: Arc::new(data_vec),
-            padded_bytes_per_row: self.padded_bytes_per_row,
-            width: self.width,
-            height: self.height,
-            frame_number: self.frame_number,
-            target_time_ns,
-        })
+        result
     }
 }
 
@@ -2178,6 +2240,17 @@ pub async fn finish_encoder_timed(
     uniforms: &ProjectUniforms,
     encoder: wgpu::CommandEncoder,
 ) -> Result<(Option<RenderedFrame>, FinishEncoderTimings), RenderingError> {
+    finish_encoder_with(session, device, queue, uniforms, encoder, readback_rgba).await
+}
+
+pub(crate) async fn finish_encoder_with<T>(
+    session: &mut RenderSession,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    uniforms: &ProjectUniforms,
+    encoder: wgpu::CommandEncoder,
+    output: impl FnOnce(&[u8], ReadbackInfo) -> Result<T, RenderingError>,
+) -> Result<(Option<T>, FinishEncoderTimings), RenderingError> {
     let mut timings = FinishEncoderTimings::default();
     let initial_buffer_size =
         (padded_bytes_per_row(uniforms.output_size) * uniforms.output_size.1) as u64;
@@ -2205,7 +2278,7 @@ pub async fn finish_encoder_timed(
 
     let wait_start = Instant::now();
     let previous_frame = if let Some(prev) = previous {
-        match prev.wait(device).await {
+        match prev.wait_with(device, output).await {
             Ok(frame) => Some(frame),
             Err(error) => {
                 drain_submitted_work(device, queue).await;
@@ -2337,9 +2410,18 @@ pub async fn flush_pending_readback(
     session: &mut RenderSession,
     device: &wgpu::Device,
 ) -> Option<Result<RenderedFrame, RenderingError>> {
+    let pending = session.pipelined_readback.as_mut()?.take_pending()?;
+    Some(pending.wait(device).await)
+}
+
+pub(crate) async fn flush_pending_readback_with<T>(
+    session: &mut RenderSession,
+    device: &wgpu::Device,
+    output: impl FnOnce(&[u8], ReadbackInfo) -> Result<T, RenderingError>,
+) -> Option<Result<T, RenderingError>> {
     let readback = session.pipelined_readback.as_mut()?;
     if let Some(pending) = readback.take_pending() {
-        Some(pending.wait(device).await)
+        Some(pending.wait_with(device, output).await)
     } else {
         None
     }
@@ -2348,6 +2430,98 @@ pub async fn flush_pending_readback(
 #[cfg(test)]
 mod readback_output_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mapped_nv12_preserves_pixels_metadata_and_releases_mapping() {
+        let instance = crate::create_wgpu_instance_sync();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+            .expect("test adapter");
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor::default())
+            .await
+            .expect("test device");
+        let pool = NV12BufferPool::new(1);
+        let mut source = vec![0u8; 256 * 4];
+        for row in 0..4 {
+            for col in 0..18 {
+                let start = row * 256 + col * 4;
+                source[start..start + 4].copy_from_slice(&[
+                    (col * 13) as u8,
+                    (row * 61) as u8,
+                    ((col + row) * 11) as u8,
+                    255,
+                ]);
+            }
+        }
+        let mut expected = vec![0; 18 * 6];
+        crate::cpu_yuv::rgba_to_nv12_bt709(&source, 18, 4, 256, &mut expected);
+        for outcome in 0..3 {
+            let buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: source.len() as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            queue.write_buffer(&buffer, 0, &source);
+            let submission = queue.submit([]);
+            let (tx, rx) = oneshot::channel();
+            buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = tx.send(result);
+                });
+            let pending = PendingReadback {
+                readiness_phase: None,
+                mapped: true,
+                rx,
+                submission,
+                buffer: buffer.clone(),
+                padded_bytes_per_row: 256,
+                width: 18,
+                height: 4,
+                frame_number: 7,
+                frame_rate: 60,
+                export_deadlines: false,
+            };
+            if outcome == 2 {
+                drop(pending);
+                device.poll(wgpu::PollType::Wait).expect("cancel poll");
+            } else {
+                let result = pending
+                    .wait_with(&device, |bytes, info| {
+                        if outcome == 1 {
+                            return Err(RenderingError::BufferMapWaitingFailed);
+                        }
+                        readback_nv12(bytes, info, &pool)
+                    })
+                    .await;
+                if outcome == 1 {
+                    assert!(matches!(
+                        result,
+                        Err(RenderingError::BufferMapWaitingFailed)
+                    ));
+                } else {
+                    let frame = result.expect("mapped conversion");
+                    assert_eq!(frame.data.as_ref(), expected);
+                    assert_eq!((frame.width, frame.height, frame.y_stride), (18, 4, 18));
+                    assert_eq!((frame.frame_number, frame.target_time_ns), (7, 116_666_666));
+                }
+            }
+            let (tx, rx) = oneshot::channel();
+            buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = tx.send(result);
+                });
+            device.poll(wgpu::PollType::Wait).expect("remap poll");
+            rx.await
+                .expect("remap callback")
+                .expect("previous mapping released");
+            buffer.unmap();
+        }
+    }
 
     #[test]
     fn readback_allocation_reserves_frame_and_metadata_without_changing_length() {
