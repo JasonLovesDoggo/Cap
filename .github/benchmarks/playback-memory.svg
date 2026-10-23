@@ -1,0 +1,43 @@
+<svg width="960" height="360" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" baseProfile="full" viewBox="0 0 960 360">
+<rect width="960" height="360" x="0" y="0" fill="#fff"></rect>
+<text dominant-baseline="central" text-anchor="start" style="font: 600 26px Arial" y="13" transform="translate(833.9 25)" fill="#1a7f37">−13.9%</text>
+<text dominant-baseline="central" text-anchor="start" style="font: 13px Arial" xml:space="preserve" y="6.5" transform="translate(801.4 61)" fill="#57606a">94.6 MiB lower median</text>
+<text dominant-baseline="central" text-anchor="start" style="font: 12px Arial" xml:space="preserve" y="6" transform="translate(24 305)" fill="#57606a">Median of 5 process runs per variant · measured 6–10 seconds after playback started</text>
+<text dominant-baseline="central" text-anchor="start" style="font: 12px Arial" xml:space="preserve" y="6" transform="translate(24 326)" fill="#57606a">720p screen + 360p camera · 480×270 output · software engine, not whole-app RSS</text>
+<path d="M90.5 105L90.5 268" fill="none" pointer-events="visible" stroke="#eaeef2" class="zr0-cls-0"></path>
+<path d="M282.5 105L282.5 268" fill="none" pointer-events="visible" stroke="#eaeef2" class="zr0-cls-0"></path>
+<path d="M475.5 105L475.5 268" fill="none" pointer-events="visible" stroke="#eaeef2" class="zr0-cls-0"></path>
+<path d="M667.5 105L667.5 268" fill="none" pointer-events="visible" stroke="#eaeef2" class="zr0-cls-0"></path>
+<path d="M860.5 105L860.5 268" fill="none" pointer-events="visible" stroke="#eaeef2" class="zr0-cls-0"></path>
+<text dominant-baseline="central" text-anchor="start" style="font-size:12px;font-family:Arial, sans-serif;" x="8" transform="translate(875 268)" fill="#57606a">MiB</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:14px;font-family:Arial, sans-serif;" transform="translate(82 145.75)" fill="#24292f">Before</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:14px;font-family:Arial, sans-serif;" transform="translate(82 227.25)" fill="#24292f">After</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:12px;font-family:Arial, sans-serif;" y="6" transform="translate(90 276)" fill="#57606a">0</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:12px;font-family:Arial, sans-serif;" y="6" transform="translate(282.5 276)" fill="#57606a">200</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:12px;font-family:Arial, sans-serif;" y="6" transform="translate(475 276)" fill="#57606a">400</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:12px;font-family:Arial, sans-serif;" y="6" transform="translate(667.5 276)" fill="#57606a">600</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:12px;font-family:Arial, sans-serif;" y="6" transform="translate(860 276)" fill="#57606a">800</text>
+<path d="M90 124.8L739.4 124.8A4 4 0 0 1 743.4 128.8L743.4 162.8A4 4 0 0 1 739.4 166.8L90 166.8L90 124.8Z" fill="#8c959f" ecmeta_series_index="0" ecmeta_data_index="0" ecmeta_ssr_type="chart" class="zr0-cls-1"></path>
+<path d="M90 206.3L648.3 206.3A4 4 0 0 1 652.3 210.3L652.3 244.3A4 4 0 0 1 648.3 248.3L90 248.3L90 206.3Z" fill="#2da44e" ecmeta_series_index="0" ecmeta_data_index="1" ecmeta_ssr_type="chart" class="zr0-cls-2"></path>
+<text dominant-baseline="central" text-anchor="start" style="font-size:16px;font-family:Arial, sans-serif;font-weight:600;" xml:space="preserve" transform="translate(755.4097 145.75)" fill="#24292f">678.9 MiB</text>
+<text dominant-baseline="central" text-anchor="start" style="font-size:16px;font-family:Arial, sans-serif;font-weight:600;" xml:space="preserve" transform="translate(664.3481 227.25)" fill="#24292f">584.3 MiB</text>
+<path d="M-5 -5l359.2 0l0 55l-359.2 0Z" transform="translate(29 27)" fill="rgb(0,0,0)" fill-opacity="0" stroke="#3c3c41" stroke-width="0" class="zr0-cls-0"></path>
+<text dominant-baseline="central" text-anchor="start" style="font-size:22px;font-family:Arial, sans-serif;font-weight:600;" xml:space="preserve" y="11" transform="translate(29 27)" fill="#3c3c41">Memory after a playback transition</text>
+<text dominant-baseline="central" text-anchor="start" style="font-size:13px;font-family:Arial, sans-serif;" xml:space="preserve" y="38.5" transform="translate(29 27)" fill="#57606a">Resident memory during ordinary playback · lower is better</text>
+<style ><![CDATA[
+.zr0-cls-0:hover {
+pointer-events:none;
+}
+.zr0-cls-1:hover {
+cursor:pointer;
+fill:rgba(154,163,174,1);
+}
+.zr0-cls-2:hover {
+cursor:pointer;
+fill:rgba(49,180,85,1);
+}
+
+]]>
+
+</style>
+</svg>
