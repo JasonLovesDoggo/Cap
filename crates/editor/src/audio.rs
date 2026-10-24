@@ -4691,6 +4691,68 @@ mod tests {
     }
 
     #[test]
+    fn removed_music_releases_after_active_renderer_and_undo_reloads_exact_audio() {
+        let _ = ffmpeg::init();
+        let dir = tempfile::tempdir().unwrap();
+        write_step_wav(&dir.path().join("first.wav"), &[2_000, 4_000]);
+        write_step_wav(&dir.path().join("second.wav"), &[8_000, 10_000]);
+        let first_project =
+            music_project(vec![music_track_segment("first.wav", 0.0, 2.0, 0.0, 0.0)]);
+        let mut cache = MusicTracks::new();
+        let first = crate::load_music_tracks(&first_project, dir.path(), &mut cache);
+        let released = Arc::downgrade(first.get("first.wav").unwrap());
+        let mut active = AudioRenderer::new(vec![]).with_music(first);
+        let replacement_project = music_project(vec![
+            music_track_segment("second.wav", 0.0, 2.0, 0.0, 0.0),
+            music_track_segment("missing.wav", 0.0, 2.0, 0.0, 0.0),
+        ]);
+        let replacement = crate::load_music_tracks(&replacement_project, dir.path(), &mut cache);
+        assert_eq!(replacement.len(), 1);
+        assert!(released.upgrade().is_some());
+        let expected_stream = render_export_audio(&mut active, &first_project, 30, 60);
+        assert!((left_at_second(&expected_stream, 0) - expected(2_000)).abs() < 0.02);
+        assert!((left_at_second(&expected_stream, 1) - expected(4_000)).abs() < 0.02);
+        drop(active);
+        assert!(released.upgrade().is_none());
+        let mut current = AudioRenderer::new(vec![]).with_music(replacement);
+        let actual = render_export_audio(&mut current, &replacement_project, 30, 60);
+        assert!((left_at_second(&actual, 0) - expected(8_000)).abs() < 0.02);
+        let restored = crate::load_music_tracks(&first_project, dir.path(), &mut cache);
+        let mut restored = AudioRenderer::new(vec![]).with_music(restored);
+        let restored = render_export_audio(&mut restored, &first_project, 30, 60);
+        assert_eq!(expected_stream.len(), restored.len());
+        assert!(
+            expected_stream
+                .iter()
+                .zip(&restored)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+    }
+
+    #[test]
+    fn removing_timeline_or_all_audible_tracks_releases_cached_audio() {
+        let _ = ffmpeg::init();
+        let dir = tempfile::tempdir().unwrap();
+        write_step_wav(&dir.path().join("music.wav"), &[2_000, 4_000]);
+        for no_timeline in [false, true] {
+            let mut project =
+                music_project(vec![music_track_segment("music.wav", 0.0, 2.0, 0.0, 0.0)]);
+            let mut cache = MusicTracks::new();
+            let original = crate::load_music_tracks(&project, dir.path(), &mut cache);
+            let released = Arc::downgrade(original.get("music.wav").unwrap());
+            drop(original);
+            if no_timeline {
+                project.timeline = None;
+            } else {
+                project.timeline.as_mut().unwrap().audio_segments[0].enabled = false;
+            }
+            let remaining = crate::load_music_tracks(&project, dir.path(), &mut cache);
+            assert!(remaining.is_empty());
+            assert!(released.upgrade().is_none());
+        }
+    }
+
+    #[test]
     fn bounded_timeline_music_unions_segments_and_skips_inaudible_tracks() {
         let _ = ffmpeg::init();
         let dir = tempfile::tempdir().unwrap();

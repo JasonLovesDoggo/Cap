@@ -29,6 +29,44 @@ pub(super) const PREVIEW_RENDER_RETRY_DELAY_MS: u64 = 120;
 const PREVIEW_CURSOR_CACHE_CAPACITY: usize = 2;
 const PREVIEW_SCRUB_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
+const RECENTLY_REMOVED_MUSIC_SAMPLE_BYTES: usize = 256 * 1024 * 1024;
+
+#[derive(Default)]
+struct InteractiveMusicCache {
+    current: crate::MusicTracks,
+    recently_removed: crate::MusicTracks,
+}
+
+impl InteractiveMusicCache {
+    fn load(&mut self, project: &ProjectConfiguration, path: &Path) -> crate::MusicTracks {
+        let mut former = self.current.clone();
+        for (path, audio) in &self.recently_removed {
+            self.current
+                .entry(path.clone())
+                .or_insert_with(|| Arc::clone(audio));
+        }
+        let result = crate::load_music_tracks(project, path, &mut self.current);
+        former.retain(|path, _| !self.current.contains_key(path));
+        self.retain_recently_removed(former, RECENTLY_REMOVED_MUSIC_SAMPLE_BYTES);
+        result
+    }
+
+    fn retain_recently_removed(&mut self, former: crate::MusicTracks, budget: usize) {
+        if !former.is_empty() {
+            let bytes = former.values().fold(0usize, |bytes, audio| {
+                bytes.saturating_add(audio.allocated_sample_bytes())
+            });
+            self.recently_removed = if bytes <= budget {
+                former
+            } else {
+                crate::MusicTracks::new()
+            };
+        }
+        self.recently_removed
+            .retain(|path, _| !self.current.contains_key(path));
+    }
+}
+
 type PreviewRequest = Option<PreviewFrameInstruction>;
 
 // A scrub sends a new request faster than a seek can decode. Abandoning the
@@ -244,7 +282,7 @@ pub struct EditorInstance {
         watch::Receiver<ProjectConfiguration>,
     ),
     pub segment_medias: Arc<Vec<SegmentMedia>>,
-    music_cache: Arc<std::sync::Mutex<crate::MusicTracks>>,
+    music_cache: Arc<std::sync::Mutex<InteractiveMusicCache>>,
     meta: RecordingMeta,
     pub export_preview_active: AtomicBool,
     pub export_active: AtomicBool,
@@ -553,7 +591,7 @@ impl EditorInstance {
             audio_output.prewarm();
         }
 
-        let music_cache = Arc::new(std::sync::Mutex::new(crate::MusicTracks::new()));
+        let music_cache = Arc::new(std::sync::Mutex::new(InteractiveMusicCache::default()));
         if has_music {
             let project = project.clone();
             let project_path = project_path.clone();
@@ -562,11 +600,7 @@ impl EditorInstance {
                 let mut cache = cache
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                drop(crate::load_music_tracks(
-                    &project,
-                    &project_path,
-                    &mut cache,
-                ));
+                drop(cache.load(&project, &project_path));
             });
         }
 
@@ -871,7 +905,7 @@ impl EditorInstance {
             let mut cache = cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            crate::load_music_tracks(&project, &project_path, &mut cache)
+            cache.load(&project, &project_path)
         })
         .await
         .unwrap_or_default()
@@ -1951,6 +1985,107 @@ fn get_calibration_offset(
 mod tests {
     use super::*;
     use cap_project::{AudioGapSummary, CursorClickEvent, CursorConfiguration, CursorMoveEvent};
+
+    fn music_selection(paths: &[&str]) -> ProjectConfiguration {
+        let audio = paths
+            .iter()
+            .map(|path| {
+                serde_json::json!({
+                    "path": path, "start": 0.0, "end": 1.0, "track": 0,
+                    "enabled": true, "trimStart": 0.0, "volumeDb": 0.0,
+                    "fadeIn": 0.0, "fadeOut": 0.0
+                })
+            })
+            .collect::<Vec<_>>();
+        ProjectConfiguration {
+            timeline: Some(
+                serde_json::from_value(serde_json::json!({
+                    "segments": [], "zoomSegments": [], "sceneSegments": [],
+                    "audioSegments": audio
+                }))
+                .unwrap(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn cached_music() -> Arc<cap_audio::AudioData> {
+        Arc::new(cap_audio::AudioData::from_samples(vec![0.5; 48_000], 1))
+    }
+
+    #[test]
+    fn interactive_music_repeat_and_one_removal_batch_stay_warm() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = cached_music();
+        let b = cached_music();
+        let mut cache = InteractiveMusicCache::default();
+        cache.current.insert("a".into(), a.clone());
+        cache.current.insert("b".into(), b.clone());
+        for paths in [&["a"][..], &["b"], &["b"], &["a"]] {
+            let loaded = cache.load(&music_selection(paths), dir.path());
+            assert_eq!(loaded.len(), 1);
+            let expected = if paths[0] == "a" { &a } else { &b };
+            assert!(Arc::ptr_eq(&loaded[paths[0]], expected));
+        }
+        cache.load(&music_selection(&["b"]), dir.path());
+        cache.current.insert("c".into(), cached_music());
+        cache.load(&music_selection(&["c"]), dir.path());
+        assert!(!cache.recently_removed.contains_key("a"));
+        assert!(Arc::ptr_eq(
+            &cache.load(&music_selection(&["b"]), dir.path())["b"],
+            &b
+        ));
+        assert!(cache.load(&music_selection(&["a"]), dir.path()).is_empty());
+        assert_eq!(a.samples()[0], 0.5);
+    }
+
+    #[test]
+    fn interactive_music_preserves_removed_paths_through_empty_and_failed_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = cached_music();
+        let mut cache = InteractiveMusicCache::default();
+        cache.current.insert("a".into(), a.clone());
+        cache.current.insert("b".into(), cached_music());
+        cache.load(&music_selection(&["b"]), dir.path());
+        cache.load(&music_selection(&["a", "b"]), dir.path());
+        assert!(cache.recently_removed.is_empty());
+        cache.load(&ProjectConfiguration::default(), dir.path());
+        assert_eq!(cache.recently_removed.len(), 2);
+        assert!(
+            cache
+                .load(&music_selection(&["missing"]), dir.path())
+                .is_empty()
+        );
+        assert_eq!(cache.recently_removed.len(), 2);
+        let mut disabled = music_selection(&["a"]);
+        disabled.timeline.as_mut().unwrap().audio_segments[0].enabled = false;
+        assert!(cache.load(&disabled, dir.path()).is_empty());
+        assert!(Arc::ptr_eq(
+            &cache.load(&music_selection(&["a"]), dir.path())["a"],
+            &a
+        ));
+    }
+
+    #[test]
+    fn interactive_music_budget_counts_spare_capacity_and_keeps_current_precedence() {
+        let mut samples = Vec::with_capacity(1024);
+        samples.push(0.5);
+        let old = Arc::new(cap_audio::AudioData::from_samples(samples, 1));
+        assert!(old.allocated_sample_bytes() >= 4096);
+        let current = cached_music();
+        let mut cache = InteractiveMusicCache::default();
+        cache.recently_removed.insert("a".into(), old.clone());
+        cache.current.insert("a".into(), current.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let loaded = cache.load(&music_selection(&["a"]), dir.path());
+        assert!(Arc::ptr_eq(&loaded["a"], &current));
+        assert!(cache.recently_removed.is_empty());
+        let former = crate::MusicTracks::from([("old".into(), old.clone())]);
+        cache.retain_recently_removed(former.clone(), old.allocated_sample_bytes());
+        assert_eq!(cache.recently_removed.len(), 1);
+        cache.retain_recently_removed(former, old.allocated_sample_bytes() - 1);
+        assert!(cache.recently_removed.is_empty());
+    }
 
     fn scrub_request(frame: u32) -> PreviewRequest {
         Some((frame, 60, XY::new(960, 540)))

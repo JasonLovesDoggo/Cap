@@ -31,6 +31,7 @@ pub fn load_music_tracks(
     let mut result = MusicTracks::new();
 
     let Some(timeline) = &project.timeline else {
+        cache.clear();
         return result;
     };
 
@@ -60,6 +61,8 @@ pub fn load_music_tracks(
             })
             .or_insert((trim_start, trim_end));
     }
+
+    cache.retain(|path, _| ranges.contains_key(path.as_str()));
 
     for (path, (source_start, source_end)) in ranges {
         if let Some(data) = cache.get(path)
