@@ -250,6 +250,10 @@ impl AudioData {
         self.samples.as_slice()
     }
 
+    pub fn allocated_sample_bytes(&self) -> usize {
+        self.samples.capacity() * std::mem::size_of::<f32>()
+    }
+
     pub fn sample_count(&self) -> usize {
         self.samples.len() / self.channels as usize
     }
