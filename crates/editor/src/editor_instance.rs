@@ -12,7 +12,7 @@ use cap_rendering::{
     get_duration, spring_mass_damper::SpringMassDamperSimulationConfig,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -1515,14 +1515,16 @@ pub struct EditorState {
     pub preview_task: Option<tokio::task::JoinHandle<()>>,
 }
 
-pub struct SegmentMedia {
+pub struct SegmentMedia<D = RecordingSegmentDecoders> {
     pub audio: AudioLoader,
     pub system_audio: AudioLoader,
     pub audio_timing_repair: SegmentAudioTimingRepair,
     pub cursor: Arc<CursorEvents>,
     pub keyboard: Arc<cap_project::KeyboardEvents>,
-    pub decoders: RecordingSegmentDecoders,
+    pub decoders: D,
 }
+
+pub type ExportSegmentMedia = SegmentMedia<Option<RecordingSegmentDecoders>>;
 
 pub type AudioLoader = cap_audio::ProgressiveAudio;
 
@@ -1758,6 +1760,51 @@ pub async fn create_segments_without_audio(
     create_segments_with_audio(recording_meta, meta, force_ffmpeg, false, None).await
 }
 
+fn export_decoder_sources(
+    project: &ProjectConfiguration,
+    source_count: usize,
+) -> Option<HashSet<u32>> {
+    let timeline = project.timeline.as_ref()?;
+    if timeline.segments.is_empty()
+        || timeline
+            .segments
+            .iter()
+            .any(|segment| segment.recording_clip as usize >= source_count)
+    {
+        return None;
+    }
+    Some(
+        timeline
+            .segments
+            .iter()
+            .map(|segment| segment.recording_clip)
+            .collect(),
+    )
+}
+
+pub async fn create_segments_for_export(
+    recording_meta: &RecordingMeta,
+    meta: &StudioRecordingMeta,
+    force_ffmpeg: bool,
+    load_audio: bool,
+    project: Option<&ProjectConfiguration>,
+) -> Result<Vec<ExportSegmentMedia>, String> {
+    let source_count = match meta {
+        StudioRecordingMeta::SingleSegment { .. } => 1,
+        StudioRecordingMeta::MultipleSegments { inner } => inner.segments.len(),
+    };
+    let selected = project.and_then(|project| export_decoder_sources(project, source_count));
+    create_selected_segments(
+        recording_meta,
+        meta,
+        force_ffmpeg,
+        load_audio,
+        None,
+        selected.as_ref(),
+    )
+    .await
+}
+
 async fn create_segments_with_audio(
     recording_meta: &RecordingMeta,
     meta: &StudioRecordingMeta,
@@ -1765,6 +1812,39 @@ async fn create_segments_with_audio(
     load_audio: bool,
     completed_audio: Option<&[CompletedAudioSegment]>,
 ) -> Result<Vec<SegmentMedia>, String> {
+    create_selected_segments(
+        recording_meta,
+        meta,
+        force_ffmpeg,
+        load_audio,
+        completed_audio,
+        None,
+    )
+    .await?
+    .into_iter()
+    .map(|segment| {
+        Ok(SegmentMedia {
+            audio: segment.audio,
+            system_audio: segment.system_audio,
+            audio_timing_repair: segment.audio_timing_repair,
+            cursor: segment.cursor,
+            keyboard: segment.keyboard,
+            decoders: segment
+                .decoders
+                .ok_or_else(|| "Ordinary segment decoder was not opened".to_string())?,
+        })
+    })
+    .collect()
+}
+
+async fn create_selected_segments(
+    recording_meta: &RecordingMeta,
+    meta: &StudioRecordingMeta,
+    force_ffmpeg: bool,
+    load_audio: bool,
+    completed_audio: Option<&[CompletedAudioSegment]>,
+    selected: Option<&HashSet<u32>>,
+) -> Result<Vec<ExportSegmentMedia>, String> {
     let legacy_log =
         std::fs::read_to_string(recording_meta.project_path.join("recording-logs.log")).ok();
     let legacy_log = legacy_log.as_deref();
@@ -1806,6 +1886,7 @@ async fn create_segments_with_audio(
                     .unwrap_or_default(),
             );
 
+            // A valid single-source timeline can only select source zero.
             let decoders = RecordingSegmentDecoders::new(
                 recording_meta,
                 meta,
@@ -1817,6 +1898,7 @@ async fn create_segments_with_audio(
                 force_ffmpeg,
             )
             .await
+            .map(Some)
             .map_err(|e| format!("SingleSegment / {e}"))?;
 
             Ok(vec![SegmentMedia {
@@ -1865,22 +1947,28 @@ async fn create_segments_with_audio(
 
                 let cursor = Arc::new(s.cursor_events(recording_meta));
 
-                let decoders = RecordingSegmentDecoders::new(
-                    recording_meta,
-                    meta,
-                    SegmentVideoPaths {
-                        display: recording_meta.path(&s.display.path),
-                        camera: s.camera.as_ref().map(|c| recording_meta.path(&c.path)),
-                    },
-                    i,
-                    force_ffmpeg,
-                )
-                .await
-                .map_err(|e| format!("MultipleSegments {i} / {e}"))?;
+                let decoders = if selected.is_none_or(|sources| sources.contains(&(i as u32))) {
+                    Some(
+                        RecordingSegmentDecoders::new(
+                            recording_meta,
+                            meta,
+                            SegmentVideoPaths {
+                                display: recording_meta.path(&s.display.path),
+                                camera: s.camera.as_ref().map(|c| recording_meta.path(&c.path)),
+                            },
+                            i,
+                            force_ffmpeg,
+                        )
+                        .await
+                        .map_err(|e| format!("MultipleSegments {i} / {e}"))?,
+                    )
+                } else {
+                    None
+                };
 
                 let keyboard = Arc::new(s.keyboard_events(recording_meta));
 
-                Ok::<SegmentMedia, String>(SegmentMedia {
+                Ok::<ExportSegmentMedia, String>(SegmentMedia {
                     audio,
                     system_audio,
                     audio_timing_repair: segment_audio_timing_repair(meta, i, legacy_log),
@@ -1951,6 +2039,29 @@ fn get_calibration_offset(
 mod tests {
     use super::*;
     use cap_project::{AudioGapSummary, CursorClickEvent, CursorConfiguration, CursorMoveEvent};
+
+    #[test]
+    fn export_decoder_sources_preserve_original_ids_and_conservative_fallbacks() {
+        let mut project = ProjectConfiguration::default();
+        assert!(export_decoder_sources(&project, 8).is_none());
+        for (indices, expected) in [
+            (vec![], None),
+            (vec![7, 2, 7, 0], Some(HashSet::from([0, 2, 7]))),
+            (vec![2, 8], None),
+        ] {
+            project.timeline = Some(
+                serde_json::from_value(serde_json::json!({
+                    "segments": indices.into_iter().map(|index| serde_json::json!({
+                        "recordingSegment": index, "start": 0.0, "end": 1.0, "timescale": 1.0
+                    })).collect::<Vec<_>>(),
+                    "zoomSegments": [],
+                    "transitions": [{"segmentIndex": 1, "type": "cross-fade", "duration": 0.2}]
+                }))
+                .unwrap(),
+            );
+            assert_eq!(export_decoder_sources(&project, 8), expected);
+        }
+    }
 
     fn scrub_request(frame: u32) -> PreviewRequest {
         Some((frame, 60, XY::new(960, 540)))

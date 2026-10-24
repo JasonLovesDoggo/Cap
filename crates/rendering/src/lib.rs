@@ -802,6 +802,8 @@ pub enum RenderingError {
         "The timeline uses recording segment {segment}, but the recording only has {available}"
     )]
     MissingRecordingSegment { segment: u32, available: usize },
+    #[error("Video decoder for recording segment {segment} is unavailable")]
+    MissingRecordingDecoder { segment: u32 },
     #[error("Timeline clip {index} has an invalid {field}: {value}")]
     InvalidTimelineSegment {
         index: usize,
@@ -857,14 +859,26 @@ pub enum RenderingError {
 pub struct RenderSegment {
     pub cursor: Arc<CursorEvents>,
     pub keyboard: Arc<cap_project::KeyboardEvents>,
-    pub decoders: RecordingSegmentDecoders,
+    pub decoders: Option<RecordingSegmentDecoders>,
     pub render_display: bool,
+}
+
+impl RenderSegment {
+    pub fn required_decoders(
+        &self,
+        segment: u32,
+    ) -> Result<&RecordingSegmentDecoders, RenderingError> {
+        self.decoders
+            .as_ref()
+            .ok_or(RenderingError::MissingRecordingDecoder { segment })
+    }
 }
 
 fn validate_timeline(
     project: &ProjectConfiguration,
-    available: usize,
+    render_segments: &[RenderSegment],
 ) -> Result<(), RenderingError> {
+    let available = render_segments.len();
     let Some(timeline) = &project.timeline else {
         return Ok(());
     };
@@ -875,6 +889,8 @@ fn validate_timeline(
                 available,
             });
         }
+        render_segments[segment.recording_clip as usize]
+            .required_decoders(segment.recording_clip)?;
         let invalid = |field, value| RenderingError::InvalidTimelineSegment {
             index,
             field,
@@ -909,7 +925,7 @@ pub async fn render_video_to_channel(
     frame_windows: Option<FrameWindows>,
 ) -> Result<(), RenderingError> {
     ffmpeg::init().unwrap();
-    validate_timeline(project, render_segments.len())?;
+    validate_timeline(project, &render_segments)?;
 
     let project = &Arc::new(project.clone());
     let start_time = Instant::now();
@@ -987,9 +1003,12 @@ pub async fn render_video_to_channel(
         constants.is_software_adapter,
     );
 
-    if let Some(first_segment) = render_segments.first() {
-        let (screen_w, screen_h) = first_segment.decoders.screen_video_dimensions();
-        let camera_dims = first_segment.decoders.camera_video_dimensions();
+    if let Some(decoders) = render_segments
+        .iter()
+        .find_map(|segment| segment.decoders.as_ref())
+    {
+        let (screen_w, screen_h) = decoders.screen_video_dimensions();
+        let camera_dims = decoders.camera_video_dimensions();
         layers.prepare_for_video_dimensions(
             &constants.device,
             screen_w,
@@ -1057,7 +1076,7 @@ pub async fn render_video_to_channel(
                     pf_result
                 } else {
                     decode_segment_frames_with_retry(
-                        &render_segment.decoders,
+                        render_segment.required_decoders(segment.recording_clip)?,
                         segment_time,
                         needs_camera && render_segment.render_display,
                         render_segment.render_display,
@@ -1070,7 +1089,7 @@ pub async fn render_video_to_channel(
                 }
             } else {
                 decode_segment_frames_with_retry(
-                    &render_segment.decoders,
+                    render_segment.required_decoders(segment.recording_clip)?,
                     segment_time,
                     needs_camera && render_segment.render_display,
                     render_segment.render_display,
@@ -1138,7 +1157,7 @@ pub async fn render_video_to_channel(
                     let next_is_initial = last_successful_frame.is_none();
 
                     Some(decode_segment_frames_with_retry(
-                        &next_render_segment.decoders,
+                        next_render_segment.required_decoders(next_segment.recording_clip)?,
                         next_seg_time,
                         needs_camera && next_render_segment.render_display,
                         next_render_segment.render_display,
@@ -1480,7 +1499,7 @@ pub async fn render_video_to_channel_nv12(
     let ffmpeg_init_start = Instant::now();
     ffmpeg::init().unwrap();
     let ffmpeg_init_ms = ffmpeg_init_start.elapsed().as_millis() as u64;
-    validate_timeline(project, render_segments.len())?;
+    validate_timeline(project, &render_segments)?;
 
     let start_time = Instant::now();
 
@@ -1574,9 +1593,12 @@ pub async fn render_video_to_channel_nv12(
             )
         });
 
-    if let Some(first_segment) = render_segments.first() {
-        let (screen_w, screen_h) = first_segment.decoders.screen_video_dimensions();
-        let camera_dims = first_segment.decoders.camera_video_dimensions();
+    if let Some(decoders) = render_segments
+        .iter()
+        .find_map(|segment| segment.decoders.as_ref())
+    {
+        let (screen_w, screen_h) = decoders.screen_video_dimensions();
+        let camera_dims = decoders.camera_video_dimensions();
         layers.prepare_for_video_dimensions(
             &constants.device,
             screen_w,
@@ -1654,7 +1676,7 @@ pub async fn render_video_to_channel_nv12(
                     pf_result
                 } else {
                     decode_segment_frames_with_retry(
-                        &render_segment.decoders,
+                        render_segment.required_decoders(segment.recording_clip)?,
                         segment_time,
                         needs_camera && render_segment.render_display,
                         render_segment.render_display,
@@ -1667,7 +1689,7 @@ pub async fn render_video_to_channel_nv12(
                 }
             } else {
                 decode_segment_frames_with_retry(
-                    &render_segment.decoders,
+                    render_segment.required_decoders(segment.recording_clip)?,
                     segment_time,
                     needs_camera && render_segment.render_display,
                     render_segment.render_display,
@@ -1737,7 +1759,7 @@ pub async fn render_video_to_channel_nv12(
                     let next_is_initial = last_successful_frame.is_none();
 
                     Some(decode_segment_frames_with_retry(
-                        &next_render_segment.decoders,
+                        next_render_segment.required_decoders(next_segment.recording_clip)?,
                         next_seg_time,
                         needs_camera && next_render_segment.render_display,
                         next_render_segment.render_display,
@@ -2248,10 +2270,11 @@ async fn decode_transition_outgoing_frames(
 ) -> Result<Option<DecodedSegmentFrames>, RenderingError> {
     let clip_index = source.segment.recording_clip as usize;
     let render_segment = &render_segments[clip_index];
+    let decoders = render_segment.required_decoders(source.segment.recording_clip)?;
     let decoders = if clip_index == incoming_clip_index {
-        render_segment.decoders.transition_side().await
+        decoders.transition_side().await
     } else {
-        &render_segment.decoders
+        decoders
     };
     let clip_config = project
         .clips
@@ -5328,6 +5351,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn export_timeline_requires_selected_decoders_but_preserves_unused_slots() {
+        let (sender, _receiver) = std::sync::mpsc::channel();
+        let mut segments = vec![
+            RenderSegment {
+                cursor: Arc::new(Default::default()),
+                keyboard: Arc::new(Default::default()),
+                decoders: None,
+                render_display: true,
+            },
+            RenderSegment {
+                cursor: Arc::new(Default::default()),
+                keyboard: Arc::new(Default::default()),
+                decoders: Some(RecordingSegmentDecoders {
+                    screen: AsyncVideoDecoderHandle::for_test(sender, 640, 360),
+                    camera: None,
+                    segment_offset: 1.5,
+                    transition_readers: None,
+                }),
+                render_display: true,
+            },
+        ];
+        let project = ProjectConfiguration {
+            timeline: Some(serde_json::from_value(serde_json::json!({
+                "segments": [{"recordingSegment": 1, "start": 0.0, "end": 1.0, "timescale": 1.0}], "zoomSegments": []
+            })).unwrap()),
+            ..Default::default()
+        };
+        assert!(validate_timeline(&project, &segments).is_ok());
+        assert_eq!(segments.len(), 2);
+        assert_eq!(
+            segments[1].required_decoders(1).unwrap().segment_offset,
+            1.5
+        );
+        segments[1].decoders = None;
+        assert!(matches!(
+            validate_timeline(&project, &segments),
+            Err(RenderingError::MissingRecordingDecoder { segment: 1 })
+        ));
+    }
+
+    #[test]
     fn color_components_parse_rgb_hex_with_either_case_and_optional_hash() {
         for hex in ["#4785FF", "4785ff", "#4785ff"] {
             assert_eq!(parse_color_component(hex, 0), 71.0 / 255.0);
@@ -6723,12 +6787,12 @@ mod export_order_tests {
                 moves: vec![],
             }),
             keyboard: Arc::new(Default::default()),
-            decoders: RecordingSegmentDecoders {
+            decoders: Some(RecordingSegmentDecoders {
                 screen,
                 camera: None,
                 segment_offset: 0.0,
                 transition_readers: None,
-            },
+            }),
             render_display: true,
         }];
         let recordings = ProjectRecordingsMeta { segments: vec![] };

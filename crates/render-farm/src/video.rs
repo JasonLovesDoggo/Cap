@@ -268,7 +268,7 @@ pub async fn render(request: VideoRequest) -> Result<VideoResult> {
         .map(|segment| RenderSegment {
             cursor: segment.cursor.clone(),
             keyboard: segment.keyboard.clone(),
-            decoders: segment.decoders.clone(),
+            decoders: Some(segment.decoders.clone()),
             render_display: true,
         })
         .collect::<Vec<_>>();

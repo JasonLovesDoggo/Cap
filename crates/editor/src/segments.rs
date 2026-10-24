@@ -115,7 +115,7 @@ async fn loaded_track(
     }
 }
 
-pub async fn get_audio_segments(segments: &[SegmentMedia]) -> Vec<AudioSegment> {
+pub async fn get_audio_segments<D>(segments: &[SegmentMedia<D>]) -> Vec<AudioSegment> {
     let mut out = Vec::with_capacity(segments.len());
 
     for s in segments {

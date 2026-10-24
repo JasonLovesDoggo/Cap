@@ -78,7 +78,7 @@ async fn render_sampled_sequence_frames(
         .map(|segment| RenderSegment {
             cursor: segment.cursor.clone(),
             keyboard: segment.keyboard.clone(),
-            decoders: segment.decoders.clone(),
+            decoders: Some(segment.decoders.clone()),
             render_display: true,
         })
         .collect();
@@ -182,7 +182,7 @@ async fn export_sequence_render_matches_editor_reference_for_real_recording()
             .map(|segment| RenderSegment {
                 cursor: segment.cursor.clone(),
                 keyboard: segment.keyboard.clone(),
-                decoders: segment.decoders.clone(),
+                decoders: Some(segment.decoders.clone()),
                 render_display: true,
             })
             .collect();
@@ -219,8 +219,12 @@ async fn export_sequence_render_matches_editor_reference_for_real_recording()
         );
 
         if let Some(first_segment) = reference_render_segments.first() {
-            let (screen_w, screen_h) = first_segment.decoders.screen_video_dimensions();
-            let camera_dims = first_segment.decoders.camera_video_dimensions();
+            let (screen_w, screen_h) = first_segment
+                .required_decoders(0)?
+                .screen_video_dimensions();
+            let camera_dims = first_segment
+                .required_decoders(0)?
+                .camera_video_dimensions();
             layers.prepare_for_video_dimensions(
                 &render_constants.device,
                 screen_w,
@@ -249,7 +253,7 @@ async fn export_sequence_render_matches_editor_reference_for_real_recording()
             zoom_timelines[clip_index].ensure_precomputed_until(zoom_until);
 
             let decoded = render_segment
-                .decoders
+                .required_decoders(timeline_segment.recording_clip)?
                 .get_frames(
                     segment_time as f32,
                     !project_config.camera.hide,

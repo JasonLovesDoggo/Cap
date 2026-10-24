@@ -141,6 +141,10 @@ pub async fn estimate_export(
     if resolution.x == 0 || resolution.y == 0 {
         return Err("Invalid export resolution".into());
     }
+    let has_explicit_timeline = project
+        .timeline
+        .as_ref()
+        .is_some_and(|timeline| !timeline.segments.is_empty());
     let mut project = project;
     if settings.cursor_only() {
         project = make_cursor_only_project(project);
@@ -235,10 +239,12 @@ pub async fn estimate_export(
     };
     let sample_medias = tokio::select! {
         _ = wait_for_stop(&editor, &cancel, deadline) => return Err("Export estimate cancelled or timed out".into()),
-        result = cap_editor::create_segments_without_audio(
+        result = cap_editor::create_segments_for_export(
         editor.meta(),
         editor.meta().studio_meta().ok_or("Cannot estimate this recording")?,
         settings.force_ffmpeg_decoder(),
+        false,
+        has_explicit_timeline.then_some(&project),
     ) => result?,
     };
     if sample_medias.len() != editor.segment_medias.len() {
