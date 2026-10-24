@@ -697,6 +697,7 @@ impl Playback {
             let mut frames_decoded: u32 = 0;
             let mut cached_project = prefetch_project.borrow().clone();
             let mut pending_frame: Option<PrefetchedFrame> = None;
+            let mut transition_scope: Option<(u32, RecordingSegmentDecoders)> = None;
 
             loop {
                 if *prefetch_stop_rx.borrow() {
@@ -705,6 +706,7 @@ impl Playback {
 
                 if prefetch_project.has_changed().unwrap_or(false) {
                     cached_project = prefetch_project.borrow_and_update().clone();
+                    transition_scope = None;
                 }
 
                 if request_changed || frame_request_rx.has_changed().unwrap_or(false) {
@@ -720,6 +722,7 @@ impl Playback {
                     );
                     seek_generation = requested_generation;
                     if reset {
+                        transition_scope = None;
                         let old_frame = next_prefetch_frame;
                         let is_backward_seek = requested < old_frame;
                         let seek_distance = if is_backward_seek {
@@ -799,6 +802,7 @@ impl Playback {
                     let prefetch_time = frame_num as f64 / fps_f64;
 
                     if prefetch_time >= prefetch_duration {
+                        transition_scope = None;
                         next_prefetch_frame = next_prefetch_frame.saturating_add(1);
                         break;
                     }
@@ -828,11 +832,29 @@ impl Playback {
                         let hide_camera = !cached_project.requires_camera();
                         let segment_index = segment.recording_clip;
                         let is_initial = frames_decoded < 10;
-                        let transition = transition_decode_request(
+                        let mut transition = transition_decode_request(
                             &cached_project,
                             &prefetch_segment_medias,
                             prefetch_time,
                         );
+
+                        if let Some(request) = transition.as_mut()
+                            && request.segment_index == segment_index
+                        {
+                            if transition_scope
+                                .as_ref()
+                                .is_none_or(|(index, _)| *index != segment_index)
+                            {
+                                transition_scope = Some((
+                                    segment_index,
+                                    request.decoders.with_fresh_transition_readers(),
+                                ));
+                            }
+                            request.decoders = transition_scope.as_ref().unwrap().1.clone();
+                        } else {
+                            // Requests already in flight retain their own clones.
+                            transition_scope = None;
+                        }
 
                         if let Ok(mut in_flight_guard) = prefetch_in_flight.write() {
                             in_flight_guard.insert(frame_num);
