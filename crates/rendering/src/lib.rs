@@ -29,7 +29,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
-use std::{borrow::Cow, path::PathBuf, time::Instant};
+use std::{path::PathBuf, time::Instant};
 use tokio::sync::mpsc;
 
 pub mod camera3d;
@@ -58,6 +58,7 @@ mod recorded_cursor_assets;
 mod scene;
 mod segment_timing;
 pub mod spring_mass_damper;
+mod style_cache;
 mod takeover;
 mod text;
 mod transition;
@@ -2571,6 +2572,7 @@ pub struct RenderVideoConstants {
     pub is_software_adapter: bool,
     adapter_name: String,
     frozen_recorded_cursors: Option<FrozenRecordedCursorAssets>,
+    style_cache: style_cache::StyleProjectCache,
 }
 
 /// Instance, adapter and device the way every renderer creates them. A
@@ -2734,6 +2736,7 @@ impl RenderVideoConstants {
             meta,
             recording_meta,
             frozen_recorded_cursors: None,
+            style_cache: Default::default(),
             is_software_adapter: shared.is_software_adapter,
             adapter_name,
         })
@@ -2764,6 +2767,7 @@ impl RenderVideoConstants {
             meta,
             recording_meta,
             frozen_recorded_cursors: None,
+            style_cache: Default::default(),
             is_software_adapter: shared.is_software_adapter,
             adapter_name,
         }
@@ -2825,6 +2829,7 @@ impl RenderVideoConstants {
             meta,
             recording_meta,
             frozen_recorded_cursors: None,
+            style_cache: Default::default(),
             is_software_adapter,
             adapter_name,
         })
@@ -4239,7 +4244,7 @@ impl ProjectUniforms {
         let camera_only_padding = project.camera_only_padding_at(timeline_time);
         let base_crop = Self::get_crop(options, project);
         let base_padding = project.background.padding;
-        let styled_project = project.style_at(timeline_time);
+        let styled_project = constants.style_cache.resolve(shared_project, timeline_time);
         let project = styled_project.as_ref();
         let styled_crop = Self::get_crop(options, project);
         let has_layout_override =
@@ -5296,10 +5301,7 @@ impl ProjectUniforms {
             frame_chrome,
             notch,
             display_outer_bounds,
-            project: match styled_project {
-                Cow::Borrowed(_) => Arc::clone(shared_project),
-                Cow::Owned(styled) => Arc::new(styled),
-            },
+            project: styled_project,
             zoom,
             scene,
             split: split_layout,
@@ -6418,6 +6420,7 @@ mod style_image_tests {
                 .clone(),
             recording_meta,
             frozen_recorded_cursors: None,
+            style_cache: Default::default(),
             background_textures: Arc::new(BackgroundTextureCache::default()),
             is_software_adapter: false,
         };
@@ -6483,10 +6486,12 @@ mod style_image_tests {
         let zoom = ZoomTransformTimeline::from_project(&project, &cursor, 3.0, XY::new(160, 90));
         let mut layers = RendererLayers::new(&constants.device, &constants.queue);
         let mut renderer = FrameRenderer::new(&constants);
-        for frame_number in [41, 42, 60, 83, 84] {
+        let shared_project = Arc::new(project.clone());
+        let mut previous_style: Option<(bool, Arc<ProjectConfiguration>)> = None;
+        for frame_number in [41, 42, 60, 83, 84, 60, 83, 41] {
             let uniforms = ProjectUniforms::new(
                 &constants,
-                &Arc::new(project.clone()),
+                &shared_project,
                 frame_number,
                 60,
                 XY::new(160, 90),
@@ -6497,6 +6502,12 @@ mod style_image_tests {
             );
             assert_eq!(uniforms.output_size, (160, 90));
             let active = (42..84).contains(&frame_number);
+            if let Some((previous_active, previous_project)) = &previous_style
+                && *previous_active == active
+            {
+                assert!(Arc::ptr_eq(previous_project, &uniforms.project));
+            }
+            previous_style = Some((active, Arc::clone(&uniforms.project)));
             if active {
                 assert!(uniforms.display.target_size[0] < uniforms.display.target_size[1]);
                 let camera = uniforms.camera_only.expect("camera-only layout");
@@ -6667,6 +6678,7 @@ mod export_order_tests {
                 .clone(),
             recording_meta,
             frozen_recorded_cursors: None,
+            style_cache: Default::default(),
             background_textures: Arc::new(BackgroundTextureCache::default()),
             is_software_adapter: is_software_adapter || software_path,
         })
@@ -7002,6 +7014,7 @@ mod nv12_flush_tests {
                 .clone(),
             recording_meta,
             frozen_recorded_cursors: None,
+            style_cache: Default::default(),
             background_textures: Arc::new(BackgroundTextureCache::default()),
             is_software_adapter,
         })
