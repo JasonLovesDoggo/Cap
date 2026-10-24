@@ -33,3 +33,11 @@ Additional current-main demonstrations:
 All recordings use Cap's real local recorder, with no microphone/system-audio capture. Web delivery preserves every frame, original duration, 1600×1000 and 30 fps; CRF28 compression only, with no trimming or speed changes. They show the actual process RSS rather than invented counters. Recording overhead means the videos are not the performance samples.
 
 Recorded/reviewed source identities: #3 local053f89b7 published1da7cbfc, identical tree dd30e22586eca416ad05a9056984a65d6fd1d1bc; #4 d9c89cf1806744beee965575bbdc9cbaa979c4a6; #5 localc06d6029 published1c133e2c, identical tree c2c6fa96e1bda0fac1cb5a6bb3b2b987d7c5d4eb; #8 73cdf394c2fa80162a57b458282a35ba7afc4137; #9 local88ccb160 published5ff41b9c, identical tree ae4a12a75c1aa17c828439c34d86935560854047. All before builds use main1fabfaefa84ed4bcc98eec1c861ca73a7ba51dd9.
+
+Deferred editor source initialization: open an eight-source project whose timeline uses source 7, seek, return to frame zero, and play. The panel samples actual Cap process RSS. Both videos preserve 419 frames at 1600×1000, 30 fps, 13.966667 seconds. They are demonstrations with capture overhead, separate from the quiet measurements.
+
+| Before | After |
+| --- | --- |
+| [Baseline MP4](deferred-editor-before.mp4) | [Deferred editor sources MP4](deferred-editor-after.mp4) |
+
+Recorded candidate source: 5ec43bdeb4b2853ac9a7b5cc4f8543c46791b2d1; published as bcdd091bf696c25be499a26ec01a8a91dae9b33d with identical complete source tree 5a75b28f898356d44c35437491f7941364af205e. The baseline is main 1fabfaefa84ed4bcc98eec1c861ca73a7ba51dd9. No microphone or system audio was captured; the Cap exports contain synthesized audio verified as exact silence. Original Cap projects and exports are retained. Delivery uses the same CRF28 encoding without trimming, resizing or speed changes.
