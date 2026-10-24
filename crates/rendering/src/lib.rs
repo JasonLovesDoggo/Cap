@@ -15,8 +15,9 @@ use decoder::{AsyncVideoDecoderHandle, spawn_decoder};
 #[cfg(target_os = "macos")]
 use frame_pipeline::finish_encoder_bgra_surface;
 use frame_pipeline::{
-    NV12BufferPool, RenderSession, finish_encoder_nv12_pooled, finish_encoder_timed,
-    flush_pending_readback,
+    NV12BufferPool, ReadbackInfo, RecycledReadbackFrames, RenderSession,
+    finish_encoder_nv12_pooled, finish_encoder_with, flush_pending_readback,
+    flush_pending_readback_with, readback_nv12, readback_rgba,
 };
 use futures::future::OptionFuture;
 use layers::{
@@ -6835,7 +6836,7 @@ mod export_order_tests {
     }
 
     #[test]
-    fn readback_allocation_failure_stops_export_without_retry_or_substitution() {
+    fn rgba_allocation_failure_stops_rgba_export_but_does_not_affect_direct_nv12() {
         for rgba in [true, false] {
             for failed_frame in [0, 5, FRAMES - 1] {
                 let Some((result, order)) =
@@ -6843,6 +6844,12 @@ mod export_order_tests {
                 else {
                     return;
                 };
+                if !rgba {
+                    result
+                        .expect("direct mapped NV12 does not allocate an intermediate RGBA frame");
+                    assert_eq!(order, (0..FRAMES).collect::<Vec<_>>());
+                    continue;
+                }
                 assert!(
                     matches!(
                         result,
@@ -7129,6 +7136,91 @@ mod nv12_flush_tests {
     }
 
     #[tokio::test]
+    async fn software_transition_nv12_matches_rgba_and_preserves_timestamps() {
+        let constants = nv12_test_constants(true).await.expect("test adapter");
+        let cursor = CursorEvents {
+            clicks: vec![],
+            moves: vec![],
+        };
+        let frames = DecodedSegmentFrames {
+            screen_size: XY::new(4, 4),
+            screen_frame: None,
+            camera_frame: None,
+            segment_time: 0.0,
+            recording_time: 0.0,
+            segment_has_camera: false,
+        };
+        let input = |frame_number, color| {
+            let mut project = ProjectConfiguration::default();
+            project.background.source = cap_project::BackgroundSource::Color {
+                value: color,
+                alpha: 255,
+            };
+            let zoom = ZoomTransformTimeline::from_project(&project, &cursor, 1.0, XY::new(4, 4));
+            let uniforms = ProjectUniforms::new(
+                &constants,
+                &Arc::new(project),
+                frame_number,
+                60,
+                XY::new(4, 4),
+                &cursor,
+                &frames,
+                1.0,
+                &zoom,
+            );
+            TransitionRenderInput {
+                segment_frames: frames.clone(),
+                uniforms,
+                cursor: &cursor,
+                render_display: false,
+            }
+        };
+        let mut rgba_renderer = FrameRenderer::new(&constants);
+        let mut nv12_renderer = FrameRenderer::new(&constants);
+        let mut rgba_layers = RendererLayers::new(&constants.device, &constants.queue);
+        let mut nv12_layers = RendererLayers::new(&constants.device, &constants.queue);
+        for (index, kind) in [
+            ClipTransitionType::CrossFade,
+            ClipTransitionType::FadeThroughBlack,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let frame_number = index as u32 + 7;
+            let outgoing = input(frame_number, [255, 0, 0]);
+            let incoming = input(frame_number, [0, 0, 255]);
+            let rgba = rgba_renderer
+                .render_transition_immediate(
+                    outgoing.clone(),
+                    incoming.clone(),
+                    kind,
+                    0.35,
+                    &mut rgba_layers,
+                )
+                .await
+                .expect("RGBA transition");
+            assert!(
+                nv12_renderer
+                    .render_transition_nv12(outgoing, incoming, kind, 0.35, &mut nv12_layers)
+                    .await
+                    .expect("NV12 transition")
+                    .is_none()
+            );
+            let nv12 = nv12_renderer
+                .flush_pipeline_nv12()
+                .await
+                .expect("pending transition")
+                .expect("transition flush");
+            let mut expected = vec![0; 24];
+            cpu_yuv::rgba_to_nv12_bt709(&rgba.data, 4, 4, rgba.padded_bytes_per_row, &mut expected);
+            assert_eq!(nv12.data.as_ref(), expected);
+            assert_eq!(nv12.frame_number, rgba.frame_number);
+            assert_eq!(nv12.target_time_ns, rgba.target_time_ns);
+            assert!(nv12_renderer.flush_pipeline_nv12().await.is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn nv12_flush_drains_the_active_readback_pipeline() {
         for software in [true, false] {
             let Some(constants) = nv12_test_constants(software).await else {
@@ -7328,6 +7420,31 @@ impl<'a> FrameRenderer<'a> {
         render_display: bool,
         layers: &mut RendererLayers,
     ) -> Result<(Option<RenderedFrame>, FrameRenderStageTimings), RenderingError> {
+        self.render_with_output(
+            segment_frames,
+            uniforms,
+            cursor,
+            render_display,
+            layers,
+            |data, info, _, recycled| readback_rgba(data, info, recycled),
+        )
+        .await
+    }
+
+    async fn render_with_output<T>(
+        &mut self,
+        segment_frames: DecodedSegmentFrames,
+        uniforms: ProjectUniforms,
+        cursor: &CursorEvents,
+        render_display: bool,
+        layers: &mut RendererLayers,
+        mut output: impl FnMut(
+            &[u8],
+            ReadbackInfo,
+            &NV12BufferPool,
+            Option<&mut RecycledReadbackFrames>,
+        ) -> Result<T, RenderingError>,
+    ) -> Result<(Option<T>, FrameRenderStageTimings), RenderingError> {
         let phase = std::mem::take(&mut self.readiness_first_render)
             .then(|| readiness::Phase::start("frame.rgba_first_render"));
         let mut last_error = None;
@@ -7365,8 +7482,8 @@ impl<'a> FrameRenderer<'a> {
                 uniforms.clone(),
                 cursor,
                 render_display,
-                layers,
-                session,
+                (layers, session),
+                |data, info, recycled| output(data, info, &self.nv12_buffer_pool, recycled),
             )
             .await
             {
@@ -7408,6 +7525,31 @@ impl<'a> FrameRenderer<'a> {
         progress: f32,
         layers: &mut RendererLayers,
     ) -> Result<Option<RenderedFrame>, RenderingError> {
+        self.render_transition_with(
+            outgoing,
+            incoming,
+            kind,
+            progress,
+            layers,
+            |data, info, _, recycled| readback_rgba(data, info, recycled),
+        )
+        .await
+    }
+
+    async fn render_transition_with<T>(
+        &mut self,
+        outgoing: TransitionRenderInput<'_>,
+        incoming: TransitionRenderInput<'_>,
+        kind: ClipTransitionType,
+        progress: f32,
+        layers: &mut RendererLayers,
+        mut output: impl FnMut(
+            &[u8],
+            ReadbackInfo,
+            &NV12BufferPool,
+            Option<&mut RecycledReadbackFrames>,
+        ) -> Result<T, RenderingError>,
+    ) -> Result<Option<T>, RenderingError> {
         let mut last_error = None;
 
         for attempt in 0..Self::MAX_RENDER_RETRIES {
@@ -7459,12 +7601,13 @@ impl<'a> FrameRenderer<'a> {
                 Err(error) => return Err(error),
             };
 
-            match finish_encoder_timed(
+            match finish_encoder_with(
                 session,
                 &self.constants.device,
                 &self.constants.queue,
                 &incoming.uniforms,
                 encoder,
+                |data, info, recycled| output(data, info, &self.nv12_buffer_pool, recycled),
             )
             .await
             {
@@ -7669,8 +7812,13 @@ impl<'a> FrameRenderer<'a> {
         &mut self,
     ) -> Option<Result<frame_pipeline::Nv12RenderedFrame, RenderingError>> {
         if self.constants.is_software_adapter {
-            let frame = self.flush_pipeline().await?;
-            return Some(frame.map(|frame| self.convert_rgba_to_nv12(frame)));
+            let session = self.session.as_mut()?;
+            return flush_pending_readback_with(
+                session,
+                &self.constants.device,
+                |data, info, _| readback_nv12(data, info, &self.nv12_buffer_pool),
+            )
+            .await;
         }
 
         let nv12_converter = self.nv12_converter.as_mut()?;
@@ -7709,10 +7857,16 @@ impl<'a> FrameRenderer<'a> {
         layers: &mut RendererLayers,
     ) -> Result<Option<frame_pipeline::Nv12RenderedFrame>, RenderingError> {
         if self.constants.is_software_adapter {
-            let frame = self
-                .render_transition(outgoing, incoming, kind, progress, layers)
-                .await?;
-            return Ok(frame.map(|frame| self.convert_rgba_to_nv12(frame)));
+            return self
+                .render_transition_with(
+                    outgoing,
+                    incoming,
+                    kind,
+                    progress,
+                    layers,
+                    |data, info, pool, _| readback_nv12(data, info, pool),
+                )
+                .await;
         }
 
         let mut last_error = None;
@@ -7889,100 +8043,16 @@ impl<'a> FrameRenderer<'a> {
         render_display: bool,
         layers: &mut RendererLayers,
     ) -> Result<Option<frame_pipeline::Nv12RenderedFrame>, RenderingError> {
-        let rgba_frame = self
-            .render(
-                segment_frames,
-                uniforms.clone(),
-                cursor,
-                render_display,
-                layers,
-            )
-            .await?;
-
-        let Some(rgba_frame) = rgba_frame else {
-            return Ok(None);
-        };
-
-        Ok(Some(self.convert_rgba_to_nv12(rgba_frame)))
-    }
-
-    fn convert_rgba_to_nv12(
-        &mut self,
-        rgba_frame: RenderedFrame,
-    ) -> frame_pipeline::Nv12RenderedFrame {
-        let width = rgba_frame.width;
-        let height = rgba_frame.height;
-        let padded_bytes_per_row = rgba_frame.padded_bytes_per_row;
-        let frame_number = rgba_frame.frame_number;
-        let target_time_ns = rgba_frame.target_time_ns;
-
-        let nv12_size = (width as usize) * (height as usize) * 3 / 2;
-        let mut nv12_buf = self.nv12_buffer_pool.acquire(nv12_size);
-
-        let y_stride = width as usize;
-        let uv_stride = width as usize;
-        let y_plane_size = y_stride * height as usize;
-        let uv_plane_size = uv_stride * (height as usize / 2);
-        nv12_buf.resize(y_plane_size + uv_plane_size, 0);
-
-        let src_data = &rgba_frame.data;
-        let src_stride = padded_bytes_per_row as usize;
-
-        for row in 0..height as usize {
-            let src_row = &src_data[row * src_stride..row * src_stride + width as usize * 4];
-            let y_row = &mut nv12_buf[row * y_stride..(row + 1) * y_stride];
-            for col in 0..width as usize {
-                let r = src_row[col * 4] as i32;
-                let g = src_row[col * 4 + 1] as i32;
-                let b = src_row[col * 4 + 2] as i32;
-                y_row[col] = cpu_yuv::bt709_luma(r, g, b);
-            }
-        }
-
-        let uv_offset = y_plane_size;
-        for row in 0..(height as usize / 2) {
-            let src_row0 =
-                &src_data[row * 2 * src_stride..row * 2 * src_stride + width as usize * 4];
-            let src_row1 = &src_data
-                [(row * 2 + 1) * src_stride..(row * 2 + 1) * src_stride + width as usize * 4];
-            let uv_row =
-                &mut nv12_buf[uv_offset + row * uv_stride..uv_offset + (row + 1) * uv_stride];
-            for col in 0..(width as usize / 2) {
-                let r = (src_row0[col * 8] as i32
-                    + src_row0[col * 8 + 4] as i32
-                    + src_row1[col * 8] as i32
-                    + src_row1[col * 8 + 4] as i32
-                    + 2)
-                    / 4;
-                let g = (src_row0[col * 8 + 1] as i32
-                    + src_row0[col * 8 + 5] as i32
-                    + src_row1[col * 8 + 1] as i32
-                    + src_row1[col * 8 + 5] as i32
-                    + 2)
-                    / 4;
-                let b = (src_row0[col * 8 + 2] as i32
-                    + src_row0[col * 8 + 6] as i32
-                    + src_row1[col * 8 + 2] as i32
-                    + src_row1[col * 8 + 6] as i32
-                    + 2)
-                    / 4;
-                [uv_row[col * 2], uv_row[col * 2 + 1]] = cpu_yuv::bt709_chroma(r, g, b);
-            }
-        }
-
-        frame_pipeline::Nv12RenderedFrame {
-            data: self.nv12_buffer_pool.wrap(nv12_buf),
-            width,
-            height,
-            y_stride: width,
-            frame_number,
-            target_time_ns,
-            format: frame_pipeline::GpuOutputFormat::Nv12,
-            #[cfg(target_os = "macos")]
-            surface: None,
-            #[cfg(target_os = "linux")]
-            gpu: None,
-        }
+        self.render_with_output(
+            segment_frames,
+            uniforms,
+            cursor,
+            render_display,
+            layers,
+            |data, info, pool, _| readback_nv12(data, info, pool),
+        )
+        .await
+        .map(|(frame, _)| frame)
     }
 
     async fn render_nv12_gpu_path(
@@ -9050,15 +9120,20 @@ impl LayerPasses<'_> {
     }
 }
 
-async fn produce_frame_with_timings(
+async fn produce_frame_with_timings<T>(
     constants: &RenderVideoConstants,
     segment_frames: DecodedSegmentFrames,
     uniforms: ProjectUniforms,
     cursor: &CursorEvents,
     render_display: bool,
-    layers: &mut RendererLayers,
-    session: &mut RenderSession,
-) -> Result<(Option<RenderedFrame>, FrameRenderStageTimings), RenderingError> {
+    state: (&mut RendererLayers, &mut RenderSession),
+    output: impl FnOnce(
+        &[u8],
+        ReadbackInfo,
+        Option<&mut RecycledReadbackFrames>,
+    ) -> Result<T, RenderingError>,
+) -> Result<(Option<T>, FrameRenderStageTimings), RenderingError> {
+    let (layers, session) = state;
     let mut encoder = constants.device.create_command_encoder(
         &(wgpu::CommandEncoderDescriptor {
             label: Some("Render Encoder"),
@@ -9090,12 +9165,13 @@ async fn produce_frame_with_timings(
     timings.layer_render_duration = layer_render_start.elapsed();
 
     let finish_start = Instant::now();
-    let (frame, finish_timings) = finish_encoder_timed(
+    let (frame, finish_timings) = finish_encoder_with(
         session,
         &constants.device,
         &constants.queue,
         &uniforms,
         encoder,
+        output,
     )
     .await?;
     timings.finish_duration = finish_start.elapsed();

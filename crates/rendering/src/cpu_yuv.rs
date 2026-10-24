@@ -1,3 +1,9 @@
+mod rgba_to_nv12;
+
+pub use rgba_to_nv12::rgba_to_nv12_bt709;
+#[cfg(test)]
+pub(crate) use rgba_to_nv12::{bt709_chroma, bt709_luma};
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -84,35 +90,6 @@ impl ConversionProgress {
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
     }
-}
-
-// RGB to limited-range BT.709 Y'CbCr in 16.16 fixed point, rounded to the
-// nearest code value: the matrix and range every export is tagged with. The
-// luma row sums to 219/255 and each chroma row to 0, so the grey axis is
-// exact (black 16/128/128, white 235/128/128).
-const BT709_Y: [i32; 3] = [11966, 40254, 4064];
-const BT709_CB: [i32; 3] = [-6596, -22189, 28785];
-const BT709_CR: [i32; 3] = [28785, -26145, -2640];
-
-#[inline(always)]
-fn fixed_16(row: [i32; 3], r: i32, g: i32, b: i32) -> i32 {
-    (row[0] * r + row[1] * g + row[2] * b + (1 << 15)) >> 16
-}
-
-/// BT.709 limited-range luma of an 8-bit RGB pixel.
-#[inline(always)]
-pub(crate) fn bt709_luma(r: i32, g: i32, b: i32) -> u8 {
-    (16 + fixed_16(BT709_Y, r, g, b)).clamp(16, 235) as u8
-}
-
-/// BT.709 limited-range (Cb, Cr) of an 8-bit RGB pixel (for 4:2:0, the mean
-/// of the 2x2 block).
-#[inline(always)]
-pub(crate) fn bt709_chroma(r: i32, g: i32, b: i32) -> [u8; 2] {
-    [
-        (128 + fixed_16(BT709_CB, r, g, b)).clamp(16, 240) as u8,
-        (128 + fixed_16(BT709_CR, r, g, b)).clamp(16, 240) as u8,
-    ]
 }
 
 /// BT.601 [`nv12_to_rgba_with_matrix`], the conversion this module always did.
