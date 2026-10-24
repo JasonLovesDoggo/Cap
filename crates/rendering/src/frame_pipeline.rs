@@ -1692,6 +1692,70 @@ pub(crate) mod readback_allocation_failure {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ReadbackInfo {
+    width: u32,
+    height: u32,
+    padded_bytes_per_row: u32,
+    frame_number: u32,
+    target_time_ns: u64,
+}
+
+pub(crate) fn readback_rgba(
+    data: &[u8],
+    info: ReadbackInfo,
+    mut recycled: Option<&mut RecycledReadbackFrames>,
+) -> Result<RenderedFrame, RenderingError> {
+    let mut owned = recycled
+        .as_mut()
+        .and_then(|pool| pool.take())
+        .unwrap_or_default();
+    reserve_readback(&mut owned, data.len(), info.frame_number)?;
+    owned.extend_from_slice(data);
+    let data = Arc::new(owned);
+    if let Some(pool) = recycled {
+        pool.keep(&data);
+    }
+    Ok(RenderedFrame {
+        data,
+        padded_bytes_per_row: info.padded_bytes_per_row,
+        width: info.width,
+        height: info.height,
+        frame_number: info.frame_number,
+        target_time_ns: info.target_time_ns,
+    })
+}
+
+pub(crate) fn readback_nv12(
+    data: &[u8],
+    info: ReadbackInfo,
+    pool: &NV12BufferPool,
+) -> Result<Nv12RenderedFrame, RenderingError> {
+    let size = info.width as usize * (info.height as usize + info.height as usize / 2);
+    let mut output = pool.acquire(size);
+    output.resize(size, 0);
+    crate::cpu_yuv::rgba_to_nv12_bt709(
+        data,
+        info.width,
+        info.height,
+        info.padded_bytes_per_row,
+        &mut output,
+    );
+    Ok(Nv12RenderedFrame {
+        data: pool.wrap(output),
+        width: info.width,
+        height: info.height,
+        y_stride: info.width,
+        frame_number: info.frame_number,
+        target_time_ns: info.target_time_ns,
+        format: GpuOutputFormat::Nv12,
+        #[cfg(target_os = "macos")]
+        surface: None,
+        #[cfg(target_os = "linux")]
+        gpu: None,
+    })
+}
+
 impl PendingReadback {
     fn unmap(&mut self) {
         if self.mapped {
@@ -1706,10 +1770,23 @@ impl PendingReadback {
     }
 
     async fn wait(
-        mut self,
+        self,
         device: &wgpu::Device,
         recycled: &mut RecycledReadbackFrames,
     ) -> Result<RenderedFrame, RenderingError> {
+        self.wait_with(device, recycled, readback_rgba).await
+    }
+
+    async fn wait_with<T>(
+        mut self,
+        device: &wgpu::Device,
+        recycled: &mut RecycledReadbackFrames,
+        output: impl FnOnce(
+            &[u8],
+            ReadbackInfo,
+            Option<&mut RecycledReadbackFrames>,
+        ) -> Result<T, RenderingError>,
+    ) -> Result<T, RenderingError> {
         let start_time = Instant::now();
         let completed = wait_for_submission(
             device,
@@ -1752,37 +1829,28 @@ impl PendingReadback {
             self.unmap();
             return Err(RenderingError::BufferMapWaitingFailed);
         };
-        let mut data_vec = if self.export_deadlines {
-            recycled.take().unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        reserve_readback(&mut data_vec, active_bytes, self.frame_number)?;
         let buffer_slice = self.buffer.slice(..active_bytes as u64);
         let data = buffer_slice.get_mapped_range();
-        data_vec.extend_from_slice(&data);
-
+        let result = output(
+            &data,
+            ReadbackInfo {
+                padded_bytes_per_row: self.padded_bytes_per_row,
+                width: self.width,
+                height: self.height,
+                frame_number: self.frame_number,
+                target_time_ns: (self.frame_number as u64 * 1_000_000_000)
+                    / self.frame_rate.max(1) as u64,
+            },
+            self.export_deadlines.then_some(recycled),
+        );
         drop(data);
         self.unmap();
-
-        let target_time_ns =
-            (self.frame_number as u64 * 1_000_000_000) / self.frame_rate.max(1) as u64;
-
-        if let Some(phase) = self.readiness_phase.take() {
+        if result.is_ok()
+            && let Some(phase) = self.readiness_phase.take()
+        {
             phase.finish("frame_ready");
         }
-        let data = Arc::new(data_vec);
-        if self.export_deadlines {
-            recycled.keep(&data);
-        }
-        Ok(RenderedFrame {
-            data,
-            padded_bytes_per_row: self.padded_bytes_per_row,
-            width: self.width,
-            height: self.height,
-            frame_number: self.frame_number,
-            target_time_ns,
-        })
+        result
     }
 }
 
@@ -1797,7 +1865,7 @@ const MAX_RECYCLED_READBACK_FRAMES: usize = 8;
 /// Export readbacks are handed downstream as `Arc<Vec<u8>>`; keeping a clone
 /// lets the next readback reuse a frame once every consumer has dropped it.
 #[derive(Default)]
-struct RecycledReadbackFrames(Vec<Arc<Vec<u8>>>);
+pub(crate) struct RecycledReadbackFrames(Vec<Arc<Vec<u8>>>);
 
 impl RecycledReadbackFrames {
     fn take(&mut self) -> Option<Vec<u8>> {
@@ -2219,6 +2287,21 @@ pub async fn finish_encoder_timed(
     uniforms: &ProjectUniforms,
     encoder: wgpu::CommandEncoder,
 ) -> Result<(Option<RenderedFrame>, FinishEncoderTimings), RenderingError> {
+    finish_encoder_with(session, device, queue, uniforms, encoder, readback_rgba).await
+}
+
+pub(crate) async fn finish_encoder_with<T>(
+    session: &mut RenderSession,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    uniforms: &ProjectUniforms,
+    encoder: wgpu::CommandEncoder,
+    output: impl FnOnce(
+        &[u8],
+        ReadbackInfo,
+        Option<&mut RecycledReadbackFrames>,
+    ) -> Result<T, RenderingError>,
+) -> Result<(Option<T>, FinishEncoderTimings), RenderingError> {
     let mut timings = FinishEncoderTimings::default();
     let initial_buffer_size =
         (padded_bytes_per_row(uniforms.output_size) * uniforms.output_size.1) as u64;
@@ -2246,7 +2329,10 @@ pub async fn finish_encoder_timed(
 
     let wait_start = Instant::now();
     let previous_frame = if let Some(prev) = previous {
-        match prev.wait(device, &mut readback.recycled_frames).await {
+        match prev
+            .wait_with(device, &mut readback.recycled_frames, output)
+            .await
+        {
             Ok(frame) => Some(frame),
             Err(error) => {
                 drain_submitted_work(device, queue).await;
@@ -2379,8 +2465,26 @@ pub async fn flush_pending_readback(
     device: &wgpu::Device,
 ) -> Option<Result<RenderedFrame, RenderingError>> {
     let readback = session.pipelined_readback.as_mut()?;
+    let pending = readback.take_pending()?;
+    Some(pending.wait(device, &mut readback.recycled_frames).await)
+}
+
+pub(crate) async fn flush_pending_readback_with<T>(
+    session: &mut RenderSession,
+    device: &wgpu::Device,
+    output: impl FnOnce(
+        &[u8],
+        ReadbackInfo,
+        Option<&mut RecycledReadbackFrames>,
+    ) -> Result<T, RenderingError>,
+) -> Option<Result<T, RenderingError>> {
+    let readback = session.pipelined_readback.as_mut()?;
     if let Some(pending) = readback.take_pending() {
-        Some(pending.wait(device, &mut readback.recycled_frames).await)
+        Some(
+            pending
+                .wait_with(device, &mut readback.recycled_frames, output)
+                .await,
+        )
     } else {
         None
     }
@@ -2389,6 +2493,100 @@ pub async fn flush_pending_readback(
 #[cfg(test)]
 mod readback_output_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mapped_nv12_preserves_pixels_metadata_and_releases_mapping() {
+        let instance = crate::create_wgpu_instance_sync();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+            .expect("test adapter");
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor::default())
+            .await
+            .expect("test device");
+        let pool = NV12BufferPool::new(1);
+        let mut source = vec![0u8; 256 * 4];
+        for row in 0..4 {
+            for col in 0..18 {
+                let start = row * 256 + col * 4;
+                source[start..start + 4].copy_from_slice(&[
+                    (col * 13) as u8,
+                    (row * 61) as u8,
+                    ((col + row) * 11) as u8,
+                    255,
+                ]);
+            }
+        }
+        let mut expected = vec![0; 18 * 6];
+        crate::cpu_yuv::rgba_to_nv12_bt709(&source, 18, 4, 256, &mut expected);
+        for (outcome, export_deadlines) in [(0, false), (0, true), (1, true), (2, true)] {
+            let buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: source.len() as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            queue.write_buffer(&buffer, 0, &source);
+            let submission = queue.submit([]);
+            let (tx, rx) = oneshot::channel();
+            buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = tx.send(result);
+                });
+            let pending = PendingReadback {
+                readiness_phase: None,
+                mapped: true,
+                rx,
+                submission,
+                buffer: buffer.clone(),
+                padded_bytes_per_row: 256,
+                width: 18,
+                height: 4,
+                frame_number: 7,
+                frame_rate: 60,
+                export_deadlines,
+            };
+            let mut recycled = RecycledReadbackFrames::default();
+            if outcome == 2 {
+                drop(pending);
+                device.poll(wgpu::PollType::Wait).expect("cancel poll");
+            } else {
+                let result = pending
+                    .wait_with(&device, &mut recycled, |bytes, info, _| {
+                        if outcome == 1 {
+                            return Err(RenderingError::BufferMapWaitingFailed);
+                        }
+                        readback_nv12(bytes, info, &pool)
+                    })
+                    .await;
+                if outcome == 1 {
+                    assert!(matches!(
+                        result,
+                        Err(RenderingError::BufferMapWaitingFailed)
+                    ));
+                } else {
+                    let frame = result.expect("mapped conversion");
+                    assert_eq!(frame.data.as_ref(), expected);
+                    assert_eq!((frame.width, frame.height, frame.y_stride), (18, 4, 18));
+                    assert_eq!((frame.frame_number, frame.target_time_ns), (7, 116_666_666));
+                }
+            }
+            assert!(recycled.0.is_empty());
+            let (tx, rx) = oneshot::channel();
+            buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = tx.send(result);
+                });
+            device.poll(wgpu::PollType::Wait).expect("remap poll");
+            rx.await
+                .expect("remap callback")
+                .expect("previous mapping released");
+            buffer.unmap();
+        }
+    }
 
     #[test]
     fn readback_allocation_reserves_frame_and_metadata_without_changing_length() {
@@ -2516,6 +2714,27 @@ mod readback_output_tests {
 #[cfg(test)]
 mod recycled_readback_tests {
     use super::*;
+
+    #[test]
+    fn rgba_consumer_reuses_only_released_frames() {
+        let mut recycled = RecycledReadbackFrames::default();
+        let info = ReadbackInfo {
+            width: 2,
+            height: 2,
+            padded_bytes_per_row: 8,
+            frame_number: 0,
+            target_time_ns: 0,
+        };
+        let first = readback_rgba(&[7; 16], info, Some(&mut recycled)).unwrap();
+        let address = first.data.as_ptr();
+        let held = first.data.clone();
+        drop(first);
+        assert!(recycled.take().is_none());
+        drop(held);
+        let second = readback_rgba(&[9; 16], info, Some(&mut recycled)).unwrap();
+        assert_eq!(second.data.as_ptr(), address);
+        assert_eq!(second.data.as_slice(), &[9; 16]);
+    }
 
     #[test]
     fn readback_frames_are_reused_only_after_every_consumer_drops_them() {
