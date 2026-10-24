@@ -243,9 +243,9 @@ impl ExportAudioPreparation {
         })
     }
 
-    pub fn finish(
+    pub fn finish<D>(
         self,
-        segments: &[SegmentMedia],
+        segments: &[SegmentMedia<D>],
     ) -> Result<ExportAudioRenderer, ExportAudioError> {
         self.finish_with_timing_repair(segments.iter().map(|segment| segment.audio_timing_repair))
     }
@@ -367,10 +367,10 @@ impl ExportAudioRenderer {
         true
     }
 
-    pub fn open(
+    pub fn open<D>(
         recording: &RecordingMeta,
         meta: &StudioRecordingMeta,
-        segments: &[SegmentMedia],
+        segments: &[SegmentMedia<D>],
         cancellation: Arc<AtomicBool>,
         abort: Arc<AtomicBool>,
     ) -> Result<Self, ExportAudioError> {
@@ -1003,9 +1003,18 @@ mod tests {
                 system_audio_offset_secs: 0.0,
             },
         ];
-        let mut renderer = prepared
-            .finish_with_timing_repair(repairs.into_iter())
-            .unwrap();
+        let segments: Vec<crate::ExportSegmentMedia> = repairs
+            .into_iter()
+            .map(|audio_timing_repair| crate::ExportSegmentMedia {
+                audio: crate::AudioLoader::none(),
+                system_audio: crate::AudioLoader::none(),
+                audio_timing_repair,
+                cursor: Arc::new(Default::default()),
+                keyboard: Arc::new(Default::default()),
+                decoders: None,
+            })
+            .collect();
+        let mut renderer = prepared.finish(&segments).unwrap();
         let after = renderer
             .sources
             .tracks
@@ -1068,7 +1077,7 @@ mod tests {
         .unwrap();
         assert!(Arc::strong_count(&user) > 1);
         assert!(matches!(
-            prepared.finish(&[]),
+            prepared.finish(&[] as &[SegmentMedia]),
             Err(ExportAudioError::InvalidWindow)
         ));
         assert_eq!(Arc::strong_count(&user), 1);
@@ -1087,7 +1096,7 @@ mod tests {
             ExportAudioRenderer::open(
                 &recording,
                 recording.studio_meta().unwrap(),
-                &[],
+                &[] as &[SegmentMedia],
                 user.clone(),
                 abort.clone(),
             ),

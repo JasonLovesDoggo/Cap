@@ -1978,7 +1978,7 @@ async fn generate_export_preview_inner(
         .map(|s| RenderSegment {
             cursor: s.cursor.clone(),
             keyboard: s.keyboard.clone(),
-            decoders: s.decoders.clone(),
+            decoders: Some(s.decoders.clone()),
             render_display: !settings.cursor_only,
         })
         .collect();
@@ -2011,7 +2011,8 @@ async fn generate_export_preview_inner(
     let render_start = Instant::now();
 
     let segment_frames = render_segment
-        .decoders
+        .required_decoders(segment.recording_clip)
+        .map_err(|error| error.to_string())?
         .get_frames(
             segment_time as f32,
             !project_config.camera.hide && render_segment.render_display,
@@ -2065,7 +2066,8 @@ async fn generate_export_preview_inner(
             .map(|clip| clip.offsets)
             .unwrap_or_default();
         let outgoing_frames = outgoing_segment
-            .decoders
+            .required_decoders(outgoing.segment.recording_clip)
+            .map_err(|error| error.to_string())?
             .get_frames(
                 outgoing.source_time as f32,
                 !project_config.camera.hide && outgoing_segment.render_display,

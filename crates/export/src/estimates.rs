@@ -280,7 +280,7 @@ pub async fn estimate_export(
                 audio_timing_repair: segment.audio_timing_repair,
                 cursor: segment.cursor.clone(),
                 keyboard: segment.keyboard.clone(),
-                decoders: sample.decoders.clone(),
+                decoders: Some(sample.decoders.clone()),
             })
             .collect(),
         output_path: temp.path().join("sample.mp4"),

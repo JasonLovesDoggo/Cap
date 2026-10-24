@@ -5,7 +5,7 @@ pub mod mp4;
 pub mod preview;
 pub mod settings;
 
-use cap_editor::{ExportAudioPreparation, ExportAudioRenderer, SegmentMedia};
+use cap_editor::{ExportAudioPreparation, ExportAudioRenderer, ExportSegmentMedia};
 use cap_project::{
     BackgroundSource, ProjectConfiguration, RecordingMeta, StudioRecordingMeta,
     TimelineConfiguration, TimelineSegment,
@@ -122,6 +122,12 @@ impl ExporterBuilder {
 
         cap_editor::release_playback_audio_caches();
         let mut project_config = self.load_project_config()?;
+        // Preserve the all-source policy for projects without an explicit edit,
+        // even after default-timeline synthesis skips empty recordings.
+        let select_video_sources = project_config
+            .timeline
+            .as_ref()
+            .is_some_and(|timeline| !timeline.segments.is_empty());
 
         let recording_meta =
             RecordingMeta::load_for_project(&self.project_path).map_err(Error::MetaLoad)?;
@@ -197,29 +203,35 @@ impl ExporterBuilder {
             let preparation = tokio::task::spawn_blocking(move || {
                 ExportAudioPreparation::open(&recording, &studio, cancellation, abort)
             });
-            let segments = cap_editor::create_segments_without_audio(
+            let segments = cap_editor::create_segments_for_export(
                 &recording_meta,
                 studio_meta,
                 self.force_ffmpeg_decoder,
+                false,
+                select_video_sources.then_some(&project_config),
             )
             .await;
             let (segments, audio) =
                 finish_audio_preparation(segments, preparation, &control.stop).await?;
             (segments, Some(audio))
         } else if !include_audio {
-            let segments = cap_editor::create_segments_without_audio(
+            let segments = cap_editor::create_segments_for_export(
                 &recording_meta,
                 studio_meta,
                 self.force_ffmpeg_decoder,
+                false,
+                select_video_sources.then_some(&project_config),
             )
             .await
             .map_err(Error::MediaLoad)?;
             (segments, None)
         } else {
-            let segments = cap_editor::create_segments(
+            let segments = cap_editor::create_segments_for_export(
                 &recording_meta,
                 studio_meta,
                 self.force_ffmpeg_decoder,
+                true,
+                select_video_sources.then_some(&project_config),
             )
             .await
             .map_err(Error::MediaLoad)?;
@@ -232,7 +244,9 @@ impl ExporterBuilder {
 
         if reads_recordings_forward(&project_config) {
             for segment in &segments {
-                segment.decoders.prefer_sequential_access();
+                if let Some(decoders) = &segment.decoders {
+                    decoders.prefer_sequential_access();
+                }
             }
         }
 
@@ -262,12 +276,12 @@ impl ExporterBuilder {
 }
 
 async fn finish_audio_preparation(
-    segments: Result<Vec<SegmentMedia>, String>,
+    segments: Result<Vec<ExportSegmentMedia>, String>,
     preparation: tokio::task::JoinHandle<
         Result<ExportAudioPreparation, cap_editor::ExportAudioError>,
     >,
     abort: &AtomicBool,
-) -> Result<(Vec<SegmentMedia>, ExportAudioRenderer), ExporterBuildError> {
+) -> Result<(Vec<ExportSegmentMedia>, ExportAudioRenderer), ExporterBuildError> {
     if segments.is_err() {
         abort.store(true, Ordering::Relaxed);
     }
@@ -457,7 +471,7 @@ pub struct ExporterBase {
     studio_meta: StudioRecordingMeta,
     recordings: Arc<ProjectRecordingsMeta>,
     render_constants: Arc<RenderVideoConstants>,
-    segments: Vec<SegmentMedia>,
+    segments: Vec<ExportSegmentMedia>,
     output_path: PathBuf,
     streaming_audio: Option<ExportAudioRenderer>,
     streaming_output: Option<mp4::TemporaryExportOutput>,

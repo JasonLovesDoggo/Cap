@@ -103,7 +103,7 @@ struct PreviewSource<'a> {
 }
 
 struct PreviewSegment<'a> {
-    decoders: &'a RecordingSegmentDecoders,
+    decoders: Option<&'a RecordingSegmentDecoders>,
     cursor: &'a CursorEvents,
 }
 
@@ -125,7 +125,7 @@ async fn render_preview_with_base(
             .segments
             .iter()
             .map(|segment| PreviewSegment {
-                decoders: &segment.decoders,
+                decoders: segment.decoders.as_ref(),
                 cursor: &segment.cursor,
             })
             .collect(),
@@ -179,7 +179,7 @@ pub async fn render_preview_with_editor(
             .segment_medias
             .iter()
             .map(|segment| PreviewSegment {
-                decoders: &segment.decoders,
+                decoders: Some(&segment.decoders),
                 cursor: &segment.cursor,
             })
             .collect(),
@@ -253,6 +253,7 @@ async fn render_preview_frame(
 
     let segment_frames = segment_media
         .decoders
+        .ok_or_else(|| ExportError::Other("Recording clip decoder is unavailable".to_string()))?
         .get_frames(
             segment_time as f32,
             project_config.requires_camera() && !settings.cursor_only,
@@ -304,10 +305,13 @@ async fn render_preview_frame(
             .find(|clip| clip.index == outgoing.segment.recording_clip)
             .map(|clip| clip.offsets)
             .unwrap_or_default();
+        let outgoing_decoders = outgoing_media.decoders.ok_or_else(|| {
+            ExportError::Other("Outgoing clip decoder is unavailable".to_string())
+        })?;
         let outgoing_decoders = if outgoing.segment.recording_clip == segment.recording_clip {
-            outgoing_media.decoders.transition_side().await
+            outgoing_decoders.transition_side().await
         } else {
-            outgoing_media.decoders
+            outgoing_decoders
         };
         let outgoing_frames = outgoing_decoders
             .get_frames(
