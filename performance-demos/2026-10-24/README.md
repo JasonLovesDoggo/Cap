@@ -19,3 +19,17 @@ PR6: actual camera Off → Light Blur → Heavy Blur playback, followed by a Hea
 | [Baseline MP4](pr6-before.mp4) | [Camera bounds MP4](pr6-after.mp4) |
 
 PR6 videos preserve all captured frames at 1600×1000 and 30 fps: before 662 frames / 22.066667 seconds; after 670 frames / 22.333333 seconds. Same CRF28 web-delivery encoding, with no trimming or speed changes.
+
+Additional current-main demonstrations:
+
+| PR / workflow | Before | After | Scope |
+| --- | --- | --- | --- |
+| #3 same-source transition and backward replay | [MP4](pr3-before.mp4) | [MP4](pr3-after.mp4) | 720p correctness demonstration; 4K readiness remains unresolved |
+| #4 software export | [MP4](pr4-before.mp4) | [MP4](pr4-after.mp4) | Correct output; historical gain is small |
+| #5 style boundary, disable and undo | [MP4](pr5-before.mp4) | [MP4](pr5-after.mp4) | Correctness demonstration; feature gain remains unproven |
+| #8 eight-clip export | [MP4](pr8-before.mp4) | [MP4](pr8-after.mp4) | Live current RSS; quiet benchmarks measure peak, not post-export retention |
+| #9 selected-source estimates and export | [MP4](pr9-before.mp4) | [MP4](pr9-after.mp4) | Live current RSS; benchmark timings collected separately |
+
+All recordings use Cap's real local recorder, with no microphone/system-audio capture. Web delivery preserves every frame, original duration, 1600×1000 and 30 fps; CRF28 compression only, with no trimming or speed changes. They show the actual process RSS rather than invented counters. Recording overhead means the videos are not the performance samples.
+
+Recorded/reviewed source identities: #3 local053f89b7 published1da7cbfc, identical tree dd30e22586eca416ad05a9056984a65d6fd1d1bc; #4 d9c89cf1806744beee965575bbdc9cbaa979c4a6; #5 localc06d6029 published1c133e2c, identical tree c2c6fa96e1bda0fac1cb5a6bb3b2b987d7c5d4eb; #8 73cdf394c2fa80162a57b458282a35ba7afc4137; #9 local88ccb160 published5ff41b9c, identical tree ae4a12a75c1aa17c828439c34d86935560854047. All before builds use main1fabfaefa84ed4bcc98eec1c861ca73a7ba51dd9.
