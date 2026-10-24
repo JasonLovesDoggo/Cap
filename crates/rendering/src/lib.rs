@@ -469,7 +469,9 @@ struct TransitionSideDecoders {
     screen: DecoderSource,
     camera: Option<DecoderSource>,
     force_ffmpeg: bool,
-    decoders: tokio::sync::OnceCell<Option<RecordingSegmentDecoders>>,
+    decoders: tokio::sync::OnceCell<Option<Arc<RecordingSegmentDecoders>>>,
+    // Serialize only initialization; each caller's OnceCell owns its lease.
+    shared: Arc<tokio::sync::Mutex<std::sync::Weak<RecordingSegmentDecoders>>>,
 }
 
 #[derive(Clone)]
@@ -588,8 +590,25 @@ impl RecordingSegmentDecoders {
                 camera: camera_source,
                 force_ffmpeg,
                 decoders: tokio::sync::OnceCell::new(),
+                shared: Arc::new(tokio::sync::Mutex::new(std::sync::Weak::new())),
             })),
         })
+    }
+
+    /// Share primary readers, but keep lazy secondary readers local to a
+    /// playback prefetch window. In-flight clones keep that window alive.
+    pub fn with_fresh_transition_readers(&self) -> Self {
+        let mut scoped = self.clone();
+        scoped.transition_readers = self.transition_readers.as_ref().map(|side| {
+            Arc::new(TransitionSideDecoders {
+                screen: side.screen.clone(),
+                camera: side.camera.clone(),
+                force_ffmpeg: side.force_ffmpeg,
+                decoders: tokio::sync::OnceCell::new(),
+                shared: side.shared.clone(),
+            })
+        });
+        scoped
     }
 
     /// The decoders for the outgoing side of a transition whose incoming
@@ -607,6 +626,10 @@ impl RecordingSegmentDecoders {
         let decoders = side
             .decoders
             .get_or_init(|| async {
+                let mut shared = side.shared.lock().await;
+                if let Some(decoders) = shared.upgrade() {
+                    return Some(decoders);
+                }
                 let screen = async {
                     if screen_shared {
                         Ok(self.screen.clone())
@@ -625,12 +648,16 @@ impl RecordingSegmentDecoders {
                     }
                 };
                 match tokio::try_join!(screen, camera) {
-                    Ok((screen, camera)) => Some(RecordingSegmentDecoders {
-                        screen,
-                        camera,
-                        segment_offset: self.segment_offset,
-                        transition_readers: None,
-                    }),
+                    Ok((screen, camera)) => {
+                        let decoders = Arc::new(RecordingSegmentDecoders {
+                            screen,
+                            camera,
+                            segment_offset: self.segment_offset,
+                            transition_readers: None,
+                        });
+                        *shared = Arc::downgrade(&decoders);
+                        Some(decoders)
+                    }
                     Err(error) => {
                         tracing::warn!(
                             %error,
@@ -641,7 +668,7 @@ impl RecordingSegmentDecoders {
                 }
             })
             .await;
-        decoders.as_ref().unwrap_or(self)
+        decoders.as_deref().unwrap_or(self)
     }
 
     pub async fn get_frames(
@@ -10882,5 +10909,84 @@ mod per_frame_cache_tests {
         assert_eq!(layers.mask.uniform_buffer_count(), 3);
         assert!(layers.mask.bind_groups_created() <= 6);
         assert!(layers.background_color_grade.bind_groups_created() <= 2);
+    }
+}
+
+#[cfg(test)]
+mod transition_reader_lifetime_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "Requires CAP_DECODER_TEST_VIDEO (at least 3 seconds, 30 fps)"]
+    async fn transition_reader_scopes_share_release_and_reopen() {
+        ffmpeg::init().unwrap();
+        let source = DecoderSource {
+            path: std::env::var_os("CAP_DECODER_TEST_VIDEO").unwrap().into(),
+            fps: 30,
+            offset: 0.0,
+        };
+        let primary = RecordingSegmentDecoders {
+            screen: spawn_screen_decoder(source.clone(), true).await.unwrap(),
+            camera: None,
+            segment_offset: 0.0,
+            transition_readers: Some(Arc::new(TransitionSideDecoders {
+                screen: source,
+                camera: None,
+                force_ffmpeg: true,
+                decoders: tokio::sync::OnceCell::new(),
+                shared: Arc::new(tokio::sync::Mutex::new(std::sync::Weak::new())),
+            })),
+        };
+        let primary_side = primary.transition_readers.as_ref().unwrap();
+        let registry = primary_side.shared.clone();
+        let first = primary.with_fresh_transition_readers();
+        let second = primary.with_fresh_transition_readers();
+
+        // Cancel deterministically while initialization waits for the registry.
+        // This does not claim to join a native worker already being opened.
+        let guard = registry.lock().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::ZERO, first.transition_side())
+                .await
+                .is_err()
+        );
+        let first_side = first.transition_readers.as_ref().unwrap();
+        assert!(first_side.decoders.get().is_none());
+        drop(guard);
+
+        let (a, b) = tokio::join!(first.transition_side(), second.transition_side());
+        assert!(std::ptr::eq(a, b));
+        assert!(primary_side.decoders.get().is_none());
+        assert!(registry.lock().await.upgrade().is_some());
+        drop(first);
+        assert!(registry.lock().await.upgrade().is_some());
+        drop(second);
+        assert!(registry.lock().await.upgrade().is_none());
+
+        // Repeated transition windows reopen, including backward source reads.
+        // Compare actual planes rather than only counting successful requests.
+        for time in [0.0, 2.0, 0.5, 2.0, 1.0] {
+            let expected = primary.screen.get_frame_initial(time).await.unwrap();
+            let scope = primary.with_fresh_transition_readers();
+            let reader = scope.transition_side().await;
+            let actual = reader.screen.get_frame_initial(time).await.unwrap();
+            assert_eq!(actual.width(), expected.width());
+            assert_eq!(actual.height(), expected.height());
+            assert_eq!(actual.y_plane(), expected.y_plane(), "Y at {time}");
+            assert_eq!(actual.u_plane(), expected.u_plane(), "U at {time}");
+            assert_eq!(actual.v_plane(), expected.v_plane(), "V at {time}");
+            assert_eq!(actual.uv_plane(), expected.uv_plane(), "UV at {time}");
+            drop(scope);
+            assert!(registry.lock().await.upgrade().is_none());
+        }
+
+        // A preview-owned reader must be reused, not duplicated or reclaimed.
+        let preview = primary.transition_side().await;
+        let scope = primary.with_fresh_transition_readers();
+        assert!(std::ptr::eq(preview, scope.transition_side().await));
+        drop(scope);
+        assert!(registry.lock().await.upgrade().is_some());
+        drop(primary);
+        assert!(registry.lock().await.upgrade().is_none());
     }
 }
