@@ -20,6 +20,8 @@ pub struct CameraLayer {
     bind_groups: [Option<wgpu::BindGroup>; 2],
     pipeline: Arc<CompositeVideoFramePipeline>,
     hidden: bool,
+    output_size: [u32; 2],
+    scissor: Option<[u32; 4]>,
     last_recording_time: Option<f32>,
     last_frame_storage: Option<DecodedFrameStorageIdentity>,
     yuv_converter: YuvToRgbaConverter,
@@ -36,6 +38,37 @@ struct BlurCacheEntry {
     mode: cap_camera_effects::BlurMode,
     texture_idx: usize,
     output_generation: u64,
+}
+
+// Keep the bound in sync with composite-video-frame.wgsl; motion blur can extend beyond it.
+fn camera_scissor(u: &CompositeVideoFrameUniforms) -> Option<[u32; 4]> {
+    if u.motion_blur_params[0] >= 0.5 && u.motion_blur_params[1] >= 0.001 {
+        return None;
+    }
+    if u.target_bounds
+        .iter()
+        .chain(u.output_size.iter())
+        .any(|v| !v.is_finite())
+        || [u.shadow, u.shadow_size, u.shadow_blur, u.border_width]
+            .iter()
+            .any(|v| !v.is_finite() || *v < 0.0)
+        || u.output_size.iter().any(|v| *v <= 0.0)
+    {
+        return None;
+    }
+    let [left, top, right, bottom] = u.target_bounds;
+    if right <= left || bottom <= top {
+        return None;
+    }
+    let half_size = ((right - left).min(bottom - top)) * 0.5;
+    let shadow = u.shadow * 0.01 * (u.shadow_size + u.shadow_blur) * 0.01 * half_size;
+    // Leave room for antialiasing and derivative helper lanes.
+    let margin = shadow.max(u.border_width) + 4.0;
+    let x = (left - margin).floor().clamp(0.0, u.output_size[0]) as u32;
+    let y = (top - margin).floor().clamp(0.0, u.output_size[1]) as u32;
+    let end_x = (right + margin).ceil().clamp(0.0, u.output_size[0]) as u32;
+    let end_y = (bottom + margin).ceil().clamp(0.0, u.output_size[1]) as u32;
+    Some([x, y, end_x.saturating_sub(x), end_y.saturating_sub(y)])
 }
 
 impl CameraLayer {
@@ -89,6 +122,8 @@ impl CameraLayer {
             bind_groups: [bind_group_0, bind_group_1],
             pipeline: composite_pipeline,
             hidden: false,
+            output_size: [0; 2],
+            scissor: None,
             last_recording_time: None,
             last_frame_storage: None,
             yuv_converter,
@@ -117,6 +152,8 @@ impl CameraLayer {
         let has_previous_frame = self.last_recording_time.is_some();
         self.hidden = frame_data.is_none() && !has_previous_frame;
 
+        self.output_size = uniforms.output_size.map(|v| v as u32);
+        self.scissor = camera_scissor(&uniforms);
         queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
         let Some((frame_size, camera_frame, recording_time)) = frame_data else {
@@ -386,6 +423,8 @@ impl CameraLayer {
         let has_previous_frame = self.last_recording_time.is_some();
         self.hidden = frame_data.is_none() && !has_previous_frame;
 
+        self.output_size = uniforms.output_size.map(|v| v as u32);
+        self.scissor = camera_scissor(&uniforms);
         queue.write_buffer(&self.uniforms_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
         let Some((frame_size, camera_frame, recording_time)) = frame_data else {
@@ -622,9 +661,18 @@ impl CameraLayer {
         };
 
         if let Some(bind_group) = bind_group {
+            if let Some([x, y, width, height]) = self.scissor {
+                if width == 0 || height == 0 {
+                    return;
+                }
+                pass.set_scissor_rect(x, y, width, height);
+            }
             pass.set_pipeline(&self.pipeline.render_pipeline);
             pass.set_bind_group(0, bind_group, &[]);
             pass.draw(0..3, 0..1);
+            if self.scissor.is_some() {
+                pass.set_scissor_rect(0, 0, self.output_size[0], self.output_size[1]);
+            }
         }
     }
 
@@ -1049,5 +1097,54 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod camera_scissor_tests {
+    use super::*;
+
+    fn rectangle(bounds: [f32; 4]) -> CompositeVideoFrameUniforms {
+        CompositeVideoFrameUniforms {
+            target_bounds: bounds,
+            output_size: [200.0, 200.0],
+            border_width: 0.0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn camera_scissor_keeps_edges_shadows_and_borders() {
+        let mut u = rectangle([80.0, 60.0, 120.0, 100.0]);
+        assert_eq!(camera_scissor(&u), Some([76, 56, 48, 48]));
+        u.shadow = 100.0;
+        u.shadow_size = 100.0;
+        u.shadow_blur = 100.0;
+        assert_eq!(camera_scissor(&u), Some([36, 16, 128, 128]));
+        u.border_width = 100.0;
+        assert_eq!(camera_scissor(&u), Some([0, 0, 200, 200]));
+    }
+
+    #[test]
+    fn camera_scissor_clamps_partial_and_fully_offscreen_frames() {
+        assert_eq!(
+            camera_scissor(&rectangle([-10.0, -10.0, 10.0, 10.0])),
+            Some([0, 0, 14, 14])
+        );
+        assert_eq!(
+            camera_scissor(&rectangle([250.0, 20.0, 300.0, 40.0])),
+            Some([200, 16, 0, 28])
+        );
+    }
+
+    #[test]
+    fn camera_scissor_falls_back_for_blur_or_invalid_geometry() {
+        let mut u = rectangle([80.0, 60.0, 120.0, 100.0]);
+        u.motion_blur_params = [1.0, 1.0, 0.0, 0.0];
+        assert_eq!(camera_scissor(&u), None);
+        u.motion_blur_params = [0.0; 4];
+        u.target_bounds[0] = f32::NAN;
+        assert_eq!(camera_scissor(&u), None);
+        assert_eq!(camera_scissor(&rectangle([120.0, 60.0, 80.0, 100.0])), None);
     }
 }
