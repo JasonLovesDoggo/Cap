@@ -24,6 +24,23 @@ use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+fn editor_sources_to_prime(project: &ProjectConfiguration, source_count: usize) -> Vec<bool> {
+    let Some(timeline) = project.timeline.as_ref().filter(|timeline| {
+        !timeline.segments.is_empty()
+            && timeline
+                .segments
+                .iter()
+                .all(|segment| (segment.recording_clip as usize) < source_count)
+    }) else {
+        return vec![true; source_count];
+    };
+    let mut selected = vec![false; source_count];
+    for segment in &timeline.segments {
+        selected[segment.recording_clip as usize] = true;
+    }
+    selected
+}
+
 pub(super) const PREVIEW_RENDER_MAX_ATTEMPTS: u32 = 3;
 pub(super) const PREVIEW_RENDER_RETRY_DELAY_MS: u64 = 120;
 const PREVIEW_CURSOR_CACHE_CAPACITY: usize = 2;
@@ -411,6 +428,7 @@ impl EditorInstance {
         }
 
         let mut project = recording_meta.project_config();
+        let sources_to_prime = editor_sources_to_prime(&project, segment_count);
 
         if project.timeline.is_none() {
             warn!("Project config has no timeline, creating one from recording segments");
@@ -529,6 +547,7 @@ impl EditorInstance {
                     force_ffmpeg_for_editor,
                     true,
                     completed_audio.as_deref(),
+                    Some(&sources_to_prime),
                 )
                 .await
             }
@@ -1747,7 +1766,7 @@ pub async fn create_segments(
     meta: &StudioRecordingMeta,
     force_ffmpeg: bool,
 ) -> Result<Vec<SegmentMedia>, String> {
-    create_segments_with_audio(recording_meta, meta, force_ffmpeg, true, None).await
+    create_segments_with_audio(recording_meta, meta, force_ffmpeg, true, None, None).await
 }
 
 pub async fn create_segments_without_audio(
@@ -1755,7 +1774,22 @@ pub async fn create_segments_without_audio(
     meta: &StudioRecordingMeta,
     force_ffmpeg: bool,
 ) -> Result<Vec<SegmentMedia>, String> {
-    create_segments_with_audio(recording_meta, meta, force_ffmpeg, false, None).await
+    create_segments_with_audio(recording_meta, meta, force_ffmpeg, false, None, None).await
+}
+
+async fn prime_software_frames(decoders: &RecordingSegmentDecoders) {
+    let software = cap_rendering::decoder::DecoderType::FFmpegSoftware;
+    let display = decoders.screen_decoder_status().decoder_type == software;
+    let camera = decoders
+        .camera_decoder_status()
+        .is_some_and(|status| status.decoder_type == software);
+    if display || camera {
+        drop(
+            decoders
+                .get_frames_initial(0.0, camera, display, Default::default())
+                .await,
+        );
+    }
 }
 
 async fn create_segments_with_audio(
@@ -1764,6 +1798,7 @@ async fn create_segments_with_audio(
     force_ffmpeg: bool,
     load_audio: bool,
     completed_audio: Option<&[CompletedAudioSegment]>,
+    sources_to_prime: Option<&[bool]>,
 ) -> Result<Vec<SegmentMedia>, String> {
     let legacy_log =
         std::fs::read_to_string(recording_meta.project_path.join("recording-logs.log")).ok();
@@ -1818,6 +1853,9 @@ async fn create_segments_with_audio(
             )
             .await
             .map_err(|e| format!("SingleSegment / {e}"))?;
+            if sources_to_prime.is_some_and(|sources| sources.first().copied().unwrap_or(true)) {
+                prime_software_frames(&decoders).await;
+            }
 
             Ok(vec![SegmentMedia {
                 audio,
@@ -1877,6 +1915,9 @@ async fn create_segments_with_audio(
                 )
                 .await
                 .map_err(|e| format!("MultipleSegments {i} / {e}"))?;
+                if sources_to_prime.is_some_and(|sources| sources.get(i).copied().unwrap_or(true)) {
+                    prime_software_frames(&decoders).await;
+                }
 
                 let keyboard = Arc::new(s.keyboard_events(recording_meta));
 
@@ -1951,6 +1992,38 @@ fn get_calibration_offset(
 mod tests {
     use super::*;
     use cap_project::{AudioGapSummary, CursorClickEvent, CursorConfiguration, CursorMoveEvent};
+
+    #[test]
+    fn editor_source_priming_preserves_indices_and_recovers_conservatively() {
+        let mut project = ProjectConfiguration::default();
+        assert_eq!(editor_sources_to_prime(&project, 8), vec![true; 8]);
+        project.timeline = Some(
+            serde_json::from_value(serde_json::json!({
+                "segments": [], "zoomSegments": []
+            }))
+            .unwrap(),
+        );
+        assert_eq!(editor_sources_to_prime(&project, 8), vec![true; 8]);
+        project.timeline.as_mut().unwrap().segments = [7, 2, 7]
+            .into_iter()
+            .map(|recording_clip| TimelineSegment {
+                recording_clip,
+                start: 0.0,
+                end: 1.0,
+                timescale: 1.0,
+                name: None,
+                speed_audio_mode: None,
+                hide_cursor: None,
+                volume: None,
+            })
+            .collect();
+        assert_eq!(
+            editor_sources_to_prime(&project, 8),
+            vec![false, false, true, false, false, false, false, true]
+        );
+        project.timeline.as_mut().unwrap().segments[0].recording_clip = 8;
+        assert_eq!(editor_sources_to_prime(&project, 8), vec![true; 8]);
+    }
 
     fn scrub_request(frame: u32) -> PreviewRequest {
         Some((frame, 60, XY::new(960, 540)))

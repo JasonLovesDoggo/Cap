@@ -2482,6 +2482,61 @@ mod managed_worker_tests {
         join.join().unwrap();
     }
 
+    #[tokio::test]
+    async fn ordinary_first_nonzero_request_and_cancelled_request_preserve_frame_zero() {
+        let directory = tempfile::tempdir().unwrap();
+        encode_gapped_segments(directory.path());
+        let (reference, reference_join) =
+            ordinary_worker(directory.path().to_path_buf(), 0.0, false).await;
+        let zero = frame_pixels(&reference.get_frame_initial(0.0).await.unwrap());
+        let later = frame_pixels(&reference.get_frame_initial(2.0).await.unwrap());
+        assert_ne!(zero, later);
+
+        for cancelled_first in [false, true] {
+            let (decoder, join) = ordinary_worker(directory.path().to_path_buf(), 0.0, false).await;
+            if cancelled_first {
+                let (reply, receiver) = oneshot::channel();
+                drop(receiver);
+                decoder
+                    .sender
+                    .send(VideoDecoderMessage::GetFrame(1.0, 0, reply))
+                    .unwrap();
+            }
+            assert_eq!(
+                frame_pixels(&decoder.get_frame_initial(2.0).await.unwrap()),
+                later
+            );
+            assert_eq!(
+                frame_pixels(&decoder.get_frame_initial(0.0).await.unwrap()),
+                zero
+            );
+            drop(decoder);
+            tokio::task::spawn_blocking(move || join.join().unwrap())
+                .await
+                .unwrap();
+        }
+        drop(reference);
+        tokio::task::spawn_blocking(move || reference_join.join().unwrap())
+            .await
+            .unwrap();
+
+        for cancelled_only in [false, true] {
+            let (decoder, join) = ordinary_worker(directory.path().to_path_buf(), 0.0, false).await;
+            if cancelled_only {
+                let (reply, receiver) = oneshot::channel();
+                drop(receiver);
+                decoder
+                    .sender
+                    .send(VideoDecoderMessage::GetFrame(1.0, 0, reply))
+                    .unwrap();
+            }
+            let started = std::time::Instant::now();
+            drop(decoder);
+            join.join().unwrap();
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+    }
+
     async fn ordinary_worker(
         path: PathBuf,
         offset: f64,

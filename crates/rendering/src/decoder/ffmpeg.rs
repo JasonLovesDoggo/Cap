@@ -534,6 +534,14 @@ impl FfmpegDecoder {
         use_hw_acceleration: bool,
         managed: Option<Arc<ManagedVideoControl>>,
     ) {
+        let mut ready_tx = Some(ready_tx);
+        let mut report_ready = |result| {
+            if let Some(sender) = ready_tx.take() {
+                let _ = sender.send(result);
+            } else if let Err(error) = result {
+                tracing::warn!(name, %error, "FFmpeg decoder failed after reporting readiness");
+            }
+        };
         let hw_device_type = if use_hw_acceleration {
             #[cfg(target_os = "windows")]
             {
@@ -562,7 +570,7 @@ impl FfmpegDecoder {
                         ManagedVideoError::Initialization(e.clone()),
                     ));
                 }
-                let _ = ready_tx.send(Err(e));
+                report_ready(Err(e));
                 return;
             }
             Ok(v) => {
@@ -605,13 +613,36 @@ impl FfmpegDecoder {
         let mut frames = this.frames();
         let mut converter = FrameConverter::new();
 
+        let mut first_request = if managed.is_none() && hw_device_type.is_none() {
+            report_ready(Ok(DecoderInitResult {
+                width: video_width,
+                height: video_height,
+                decoder_type: DecoderType::FFmpegSoftware,
+            }));
+            loop {
+                let Ok(request) = rx.recv() else {
+                    return;
+                };
+                let VideoDecoderMessage::GetFrame(_, _, reply) = &request;
+                if !reply.is_closed() {
+                    break Some(request);
+                }
+            }
+        } else {
+            None
+        };
+
         let first_frame_result = match first_frame(&mut frames, managed.as_ref()) {
             Ok(frame) => frame,
             Err(error) => {
-                let _ = ready_tx.send(Err(error.to_string()));
+                report_ready(Err(error.to_string()));
                 return;
             }
         };
+
+        if first_frame_result.is_none() && first_request.is_some() {
+            tracing::warn!(name, "Deferred FFmpeg decoder produced no initial frame");
+        }
 
         if first_frame_result.is_none() && is_hw {
             let mut sw_this = match input.open(None, managed.as_ref()) {
@@ -622,7 +653,7 @@ impl FfmpegDecoder {
                             ManagedVideoError::Initialization(e.clone()),
                         ));
                     }
-                    let _ = ready_tx.send(Err(format!("Software fallback failed: {e}")));
+                    report_ready(Err(format!("Software fallback failed: {e}")));
                     return;
                 }
                 Ok(v) => v,
@@ -651,7 +682,7 @@ impl FfmpegDecoder {
             let first_software_frame = match first_frame(&mut sw_frames, managed.as_ref()) {
                 Ok(frame) => frame,
                 Err(error) => {
-                    let _ = ready_tx.send(Err(error.to_string()));
+                    report_ready(Err(error.to_string()));
                     return;
                 }
             };
@@ -659,7 +690,7 @@ impl FfmpegDecoder {
                 && let Some(control) = &managed
             {
                 let error = control.fail(ManagedVideoError::NoFrames);
-                let _ = ready_tx.send(Err(error.to_string()));
+                report_ready(Err(error.to_string()));
                 return;
             }
             if let Some(frame) = first_software_frame {
@@ -684,7 +715,7 @@ impl FfmpegDecoder {
                 height: video_height,
                 decoder_type: sw_decoder_type,
             };
-            let _ = ready_tx.send(Ok(sw_init_result));
+            report_ready(Ok(sw_init_result));
 
             while let Ok(r) = rx.recv() {
                 if managed_stopped(managed.as_ref()) {
@@ -1134,7 +1165,7 @@ impl FfmpegDecoder {
             && let Some(control) = &managed
         {
             let error = control.fail(ManagedVideoError::NoFrames);
-            let _ = ready_tx.send(Err(error.to_string()));
+            report_ready(Err(error.to_string()));
             return;
         }
         if let Some(frame) = first_frame_result {
@@ -1170,7 +1201,7 @@ impl FfmpegDecoder {
             height: video_height,
             decoder_type,
         };
-        let _ = ready_tx.send(Ok(init_result));
+        report_ready(Ok(init_result));
 
         // Export read-ahead: with no request pending, keep decoding forward
         // into the cache so the renderer's next sequential request is served
@@ -1191,7 +1222,9 @@ impl FfmpegDecoder {
             .min(readahead_limit);
         let mut readahead_exhausted = false;
         loop {
-            let r = if readahead > 0 {
+            let r = if let Some(request) = first_request.take() {
+                request
+            } else if readahead > 0 {
                 match rx.try_recv() {
                     Ok(message) => message,
                     Err(mpsc::TryRecvError::Disconnected) => break,
